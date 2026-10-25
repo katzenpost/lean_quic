@@ -8,6 +8,7 @@ import Std.Async.Timer
 import Std.Time
 import Std.Data.HashMap
 import LeanQUIC.Connection
+import LeanQUIC.Endpoint
 import LeanTLS.X509
 
 namespace LeanQUIC.UDP
@@ -139,7 +140,7 @@ structure Peers where
 
 /-- Serve forever: connections are found by the Destination Connection ID of each datagram, and
 `app` is run on a connection after each of its events. -/
-partial def runServer (cfg : Config) (tls : LeanTLS.Handshake.Server.Config) (listen : SocketAddress)
+partial def runServer (cfg : Endpoint.Config) (listen : SocketAddress)
     (app : Conn → Conn) (onReady : IO Unit) : IO Unit := do
   let sock ← Socket.mk
   sock.bind listen
@@ -171,14 +172,16 @@ partial def runServer (cfg : Config) (tls : LeanTLS.Handshake.Server.Config) (li
           let i := ps.byCid[dcid]!
           ps := { ps with conns := ps.conns.insert i { p with addr, conn := app (p.conn.recv now d) } }
         | none =>
-          if let .long .initial 1 _ scid _ _ := hdr then
-            if d.size ≥ maxDatagram && dcid.size ≥ 8 then
-              let localCid ← (randomBytes cidLength : IO _)
-              let c := Conn.newServer cfg tls (← (randomSeed : IO _)) localCid dcid scid now
-              let c := app (c.recv now d)
-              let i := ps.next
-              ps := { conns := ps.conns.insert i { addr, conn := c, cids := [dcid, localCid] },
-                      byCid := (ps.byCid.insert dcid i).insert localCid i, next := i + 1 }
+          let fresh ← (randomBytes cidLength : IO _)
+          let seed ← (randomSeed : IO _)
+          match Endpoint.onUnknown cfg (toString addr).toUTF8 d now fresh seed with
+          | .drop => pure ()
+          | .retry pkt => sock.send pkt (some addr)
+          | .accept c cids =>
+            let c := app (c.recv now d)
+            let i := ps.next
+            ps := { conns := ps.conns.insert i { addr, conn := c, cids },
+                    byCid := cids.foldl (fun m cid => m.insert cid i) ps.byCid, next := i + 1 }
       | none => pure ()
     | .datagram _ none => pure ()
     loop ps

@@ -6,4 +6,5 @@ import LeanQUIC.TransportParams
 import LeanQUIC.Recovery
 import LeanQUIC.Buffers
 import LeanQUIC.Connection
+import LeanQUIC.Endpoint
 import LeanQUIC.UDP

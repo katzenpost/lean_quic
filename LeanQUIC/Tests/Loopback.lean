@@ -48,6 +48,7 @@ structure Sim where
   wire : Array (Nat × Bool × ByteArray) := #[]
   sentDatagrams : Nat := 0
   dropped : Nat := 0
+  retries : Nat := 0
 
 def pattern (n : Nat) : ByteArray := ⟨Array.ofFn fun i : Fin n => UInt8.ofNat (i.val % 251)⟩
 
@@ -94,19 +95,19 @@ def echo (c : Conn) : Conn := Id.run do
     c := c.retire id
   pure c
 
-def deliver (sim : Sim) (toServer : Bool) (d : ByteArray) : Sim :=
+def endpoint (retry : Bool) : Endpoint.Config :=
+  { tls := serverTls, retry, tokenKey := ⟨Array.replicate 32 3⟩ }
+
+def deliver (retry : Bool) (sim : Sim) (toServer : Bool) (d : ByteArray) : Sim :=
   if toServer then
     match sim.server with
     | some s => { sim with server := some (echo (s.recv sim.now d)) }
     | none =>
-      match parseHeader d 0 0 with
-      | some (.long .initial _ dcid scid _ _, _) =>
-        -- As a real server: Initials in datagrams under 1200 bytes are dropped.
-        if d.size < maxDatagram then { sim with dropped := sim.dropped + 1 } else
-        let seed : Vector UInt8 32 := Vector.ofFn fun i => UInt8.ofNat (200 + i.val)
-        let s := Conn.newServer {} serverTls seed ⟨#[7, 7, 7, 7, 7, 7, 7, 7]⟩ dcid scid sim.now
-        { sim with server := some (echo (s.recv sim.now d)) }
-      | _ => sim
+      let seed : Vector UInt8 32 := Vector.ofFn fun i => UInt8.ofNat (200 + i.val)
+      match Endpoint.onUnknown (endpoint retry) "127.0.0.1:1".toUTF8 d sim.now ⟨#[7, 7, 7, 7, 7, 7, 7, 7]⟩ seed with
+      | .drop => { sim with dropped := sim.dropped + 1 }
+      | .retry pkt => { sim with wire := sim.wire.push (sim.now + 10000, false, pkt), retries := sim.retries + 1 }
+      | .accept s _ => { sim with server := some (echo (s.recv sim.now d)) }
   else { sim with client := sim.client.recv sim.now d }
 
 structure Outcome where
@@ -115,7 +116,7 @@ structure Outcome where
   millis : Nat
 
 /-- Run the client application: payloads of `size` bytes on `streams` streams in turn. -/
-def runTransfer (net : Net) (size streams : Nat) (seed : Nat) : IO Outcome := do
+def runTransfer (net : Net) (size streams : Nat) (seed : Nat) (retry : Bool) : IO Outcome := do
   let t0 ← IO.monoMsNow
   let cseed : Vector UInt8 32 := Vector.ofFn fun i => UInt8.ofNat (i.val + seed)
   let start := 1000000
@@ -167,7 +168,7 @@ def runTransfer (net : Net) (size streams : Nat) (seed : Nat) : IO Outcome := do
     -- Stable: datagrams with one arrival time keep their sending order.
     let ordered := (due.zipIdx.qsort fun (a, i) (b, j) => a.1 < b.1 || (a.1 == b.1 && i < j)).map (·.1)
     for (_, toServer, d) in ordered do
-      sim := deliver sim toServer d
+      sim := deliver retry sim toServer d
     if sim.client.nextTimeout.any (· ≤ sim.now) then
       sim := { sim with client := sim.client.onTimeout sim.now }
     if let some s := sim.server then
@@ -179,7 +180,7 @@ def runTransfer (net : Net) (size streams : Nat) (seed : Nat) : IO Outcome := do
   | none =>
     if done == streams then
       pure { ok := true, millis := t1 - t0,
-             detail := s!"{size * streams} bytes, {sim.sentDatagrams} datagrams ({sim.dropped} dropped), {simulated} ms simulated" }
+             detail := s!"{size * streams} bytes, {sim.sentDatagrams} datagrams ({sim.dropped} dropped), {sim.retries} Retry, {simulated} ms simulated" }
     else pure { ok := false, millis := t1 - t0,
                 detail := s!"stalled after {done} streams, established {sim.client.isEstablished}, {simulated} ms simulated" }
 
@@ -196,8 +197,9 @@ def main : IO UInt32 := do
     ("5% loss, 3 MB", ⟨5, 5, 1⟩, 3000000, 1)]
   for (name, net, size, streams) in cases do
     for seed in [1, 2, 3] do
-      let o ← runTransfer net size streams seed
-      IO.println s!"  {if o.ok then "ok  " else "FAIL"}  {name} (seed {seed}): {o.detail}, {o.millis} ms"
+      let retry := seed != 3
+      let o ← runTransfer net size streams seed retry
+      IO.println s!"  {if o.ok then "ok  " else "FAIL"}  {name} (seed {seed}{if retry then ", Retry" else ""}): {o.detail}, {o.millis} ms"
       if !o.ok then failed := failed + 1
   IO.println (if failed == 0 then "all loopback transfers passed" else s!"{failed} loopback transfers failed")
   pure (if failed == 0 then 0 else 1)

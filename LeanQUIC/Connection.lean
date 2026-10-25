@@ -771,18 +771,20 @@ def newClient (cfg : Config) (tlsCfg : LeanTLS.Handshake.Client.Config) (seed : 
       c := c.modifySpace (Space.ofLevel l) fun sp => { sp with cryptoSend := sp.cryptoSend.write d }
   pure c
 
-/-- A server connection for a client's first Initial, addressed to `odcid`. -/
+/-- A server connection for a client's first Initial, addressed to `odcid`. After a Retry the
+client's Initial is addressed to `retrySource`, the connection ID the Retry gave it, and the
+client's address is already validated by the token. -/
 def newServer (cfg : Config) (tlsCfg : LeanTLS.Handshake.Server.Config) (seed : Vector UInt8 32)
-    (localCid odcid peerCid : ByteArray) (now : Nat) : Conn :=
-  let params := localTransportParams cfg false localCid odcid none
+    (localCid odcid peerCid : ByteArray) (now : Nat) (retrySource : Option ByteArray := none) : Conn :=
+  let params := localTransportParams cfg false localCid odcid retrySource
   let tlsCfg := { tlsCfg with transportParams := params.encode }
-  let (sk, ck) := initialKeys odcid
+  let (sk, ck) := initialKeys (retrySource.getD odcid)
   let c : Conn :=
     { isClient := false, config := cfg, tls := .server tlsCfg seed LeanTLS.Handshake.Server.init,
-      localCid, remoteCid := peerCid, remoteCidSet := true, originalDcid := odcid,
-      recovery := (Recovery.init false maxDatagram).setPeerCompletedAddressValidation,
+      localCid, remoteCid := peerCid, remoteCidSet := true, originalDcid := retrySource.getD odcid,
+      retrySource, recovery := (Recovery.init false maxDatagram).setPeerCompletedAddressValidation,
       localParams := params, nextLocalStream := 1, localMaxStreams := cfg.maxStreamsBidi,
-      localMaxData := cfg.maxData, addressValidated := false,
+      localMaxData := cfg.maxData, addressValidated := retrySource.isSome,
       idleDeadline := some (now + cfg.idleTimeout * 1000) }
   c.setSpace .initial { c.initial with writeKeys := some ck, readKeys := some sk }
 

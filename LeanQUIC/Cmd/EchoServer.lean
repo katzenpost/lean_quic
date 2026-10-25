@@ -6,9 +6,10 @@ open LeanQUIC.UDP
 open Cryptlib.Util.HexBytes (hexStringToByteArray byteArrayToHex)
 open Cryptlib.Util.Bytes (toVecN)
 
-/-! `quic_echo_server --listen 127.0.0.1:PORT --seed HEX64`: a QUIC echo server authenticating
-with the Ed25519 key from `seed`, in the shape of katzenpost's QUIC transport (ALPN `h3`,
-X25519MLKEM768). Prints `SPKI-SHA256 <hex>` and `READY`, then echoes every stream. -/
+/-! `quic_echo_server --listen 127.0.0.1:PORT --seed HEX64 [--no-retry]`: a QUIC echo server
+authenticating with the Ed25519 key from `seed`, in the shape of katzenpost's QUIC transport (ALPN
+`h3`, X25519MLKEM768, a Retry before every connection). Prints `SPKI-SHA256 <hex>` and `READY`,
+then echoes every stream. -/
 
 def argOf (args : List String) (name : String) : Option String :=
   match args.dropWhile (· != name) with
@@ -26,7 +27,8 @@ def main (args : List String) : IO UInt32 := do
   let some pin := spkiPin cert | IO.eprintln "certificate does not parse"; return 1
   let tls : LeanTLS.Handshake.Server.Config :=
     { alpn := "h3".toUTF8, transportParams := ByteArray.empty, signingKey := key, certificate := cert }
-  runServer {} tls listen echo do
+  let cfg : Endpoint.Config := { tls, tokenKey := ← randomBytes 32, retry := !args.contains "--no-retry" }
+  runServer cfg listen echo do
     IO.println s!"SPKI-SHA256 {byteArrayToHex pin}"
     IO.println "READY"
     (← IO.getStdout).flush
