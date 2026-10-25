@@ -150,6 +150,8 @@ structure Conn where
   /-- Peer-initiated streams the application has not yet been told of. -/
   incoming : Array Nat := #[]
   nextLocalStream : Nat
+  /-- Peer-initiated bidirectional streams opened so far; lower numbers are open or closed. -/
+  peerStreamsOpened : Nat := 0
   peerMaxStreams : Nat := 0
   localMaxStreams : Nat
   peerMaxData : Nat := 0
@@ -282,20 +284,29 @@ def streamLimitFor (c : Conn) (id : Nat) : Nat :=
     let localInitiated := (id % 2 == 0) == c.isClient
     if localInitiated then p.initialMaxStreamDataBidiRemote else p.initialMaxStreamDataBidiLocal
 
-/-- Get or create a stream the peer refers to. Locally initiated ones must already exist. -/
-def peerStream (c : Conn) (id : Nat) : Except (TransportError × String) (Conn × Stream) := do
-  if let some s := c.streams[id]? then return (c, s)
+/-- The stream a peer's frame refers to, created if new; `none` for one already closed, whose
+late or duplicated frames are ignored. -/
+def peerStream (c : Conn) (id : Nat) : Except (TransportError × String) (Conn × Option Stream) := do
+  if let some s := c.streams[id]? then return (c, some s)
   if id % 4 >= 2 then throw (.streamState, "unidirectional stream")
   let localInitiated := (id % 2 == 0) == c.isClient
-  if localInitiated then throw (.streamState, "unopened local stream")
+  if localInitiated then
+    if id < c.nextLocalStream then return (c, none)
+    throw (.streamState, "unopened local stream")
+  if id / 4 < c.peerStreamsOpened then return (c, none)
   if id / 4 >= c.localMaxStreams then throw (.streamLimit, "stream limit")
-  let s : Stream := { recv := Buffers.Recv.init c.config.maxStreamData, sendLimit := c.streamLimitFor id,
-                      advertised := c.config.maxStreamData }
-  -- Lower-numbered peer streams of the same type open implicitly; this side opens in order.
-  pure ({ c with streams := c.streams.insert id s, incoming := c.incoming.push id }, s)
+  -- Lower-numbered peer streams open implicitly (RFC 9000 §3.2).
+  let mut c := c
+  for n in [c.peerStreamsOpened:id / 4 + 1] do
+    let sid := 4 * n + (if c.isClient then 1 else 0)
+    let s : Stream := { recv := Buffers.Recv.init c.config.maxStreamData, sendLimit := c.streamLimitFor sid,
+                        advertised := c.config.maxStreamData }
+    c := { c with streams := c.streams.insert sid s, incoming := c.incoming.push sid }
+  c := { c with peerStreamsOpened := id / 4 + 1 }
+  pure (c, c.streams[id]?)
 
 def onStreamFrame (c : Conn) (id offset : Nat) (data : ByteArray) (fin : Bool) : Except (TransportError × String) Conn := do
-  let (c, s) ← c.peerStream id
+  let (c, some s) ← c.peerStream id | return c
   let before := s.recv.highestOffset
   let recv ← match s.recv.insert offset data fin with
     | .ok r => pure r
@@ -565,19 +576,21 @@ def headerFor (c : Conn) (sp : Space) (pn pnLen payloadLen : Nat) : ByteArray :=
   | .handshake => longHeader .handshake c.remoteCid c.localCid ByteArray.empty pn pnLen payloadLen
   | .application => shortHeader c.remoteCid c.keyPhase pn pnLen
 
-/-- Seal a packet from built frames; the payload is padded to `padTo` bytes if smaller. -/
-def sealPacket (c : Conn) (now : Nat) (sp : Space) (keys : Keys) (b : Built) (padTo : Nat) :
+/-- Seal a packet from built frames; with `target` nonzero, padded to exactly `target` bytes. -/
+def sealPacket (c : Conn) (now : Nat) (sp : Space) (keys : Keys) (b : Built) (target : Nat) :
     Conn × ByteArray :=
   let s := c.space sp
   let pn := s.nextPn
   let pnLen := pnLength pn s.largestAcked
-  let minPayload := max padTo (4 - min 4 pnLen)
+  -- The header's size does not depend on the payload's: Length is always two bytes.
+  let hdrSize := (c.headerFor sp pn pnLen 0).size
+  let minPayload := max (target - min target (hdrSize + tagSize)) (4 - min 4 pnLen)
   let payload := (b.frames.foldl (fun acc f => acc ++ f.encode) ByteArray.empty)
   let payload := if payload.size < minPayload then
     payload ++ ⟨Array.replicate (minPayload - payload.size) 0⟩ else payload
   let hdr := c.headerFor sp pn pnLen payload.size
   let pkt := protect keys (sp != .application) hdr pn pnLen payload
-  let inFlight := b.eliciting || padTo > 0
+  let inFlight := b.eliciting || target > 0
   let sent := if b.sent.isEmpty && !b.eliciting then s.sent else s.sent.insert pn b.sent
   let c := c.setSpace sp { s with nextPn := pn + 1, sent }
   let record : Recovery.SentPacket :=
@@ -609,41 +622,41 @@ def poll (c : Conn) (now : Nat) : Conn × Option ByteArray := Id.run do
     return ({ c with phase := .closing d f true }, some pkt)
   | _ => pure ()
   let mut c := c
-  let mut dgram := ByteArray.empty
   let limit := min maxDatagram c.amplificationAllowance
   let cwndOk := c.recovery.sendAllowance ≥ maxDatagram || c.probe.isSome
-  let mut paddedInitial := false
+  -- First the frames of each packet, then the packets, so the last can pad the datagram.
+  let mut parts : Array (Space × Keys × Built) := #[]
+  let mut used := 0
   for sp in [Space.initial, .handshake, .application] do
     let some keys := (c.space sp).writeKeys | continue
     if (c.space sp).discarded then continue
     let overhead := c.headerOverhead sp + tagSize
-    if dgram.size + overhead + 8 > limit then continue
-    let budget := limit - dgram.size - overhead
+    if used + overhead + 8 > limit then continue
+    let budget := limit - used - overhead
     let probeHere := match c.probe with | some (psp, _) => psp == sp | none => false
     let c0 := if probeHere || c.probe.isNone then c else { c with probe := none }
     let (c1, b) := c0.buildFrames now sp budget cwndOk
-    let c1 := if probeHere || c.probe.isNone then c1 else { c1 with probe := c.probe }
+    c := if probeHere || c.probe.isNone then c1 else { c1 with probe := c.probe }
     if b.frames.isEmpty then continue
-    -- A client pads every datagram with an Initial, a server those with ack-eliciting Initials.
-    let pad := if sp == .initial && (c.isClient || b.eliciting) then
-        limit - min limit (dgram.size + overhead + 16) else 0
-    let padTo := if sp == .initial && pad > 0 && (c.handshake.writeKeys.isNone || c.handshake.discarded)
-      then pad else 0
-    let (c2, pkt) := c1.sealPacket now sp keys b padTo
-    c := c2
-    if sp == .initial && padTo > 0 then paddedInitial := true
-    dgram := dgram ++ pkt
-    -- The client drops Initial keys once it sends a Handshake packet (RFC 9001 §4.9.1).
-    if c.isClient && sp == .handshake then c := c.discardSpace .initial
+    parts := parts.push (sp, keys, b)
+    used := used + overhead + b.size
     if probeHere then
       c := { c with probe := match c.probe with
         | some (psp, n) => if n > 1 then some (psp, n - 1) else none
         | none => none }
-  if dgram.size == 0 then return (c, none)
-  -- A datagram with an Initial that went unpadded (Handshake data followed) is padded now.
-  if !paddedInitial && (c.isClient || !c.addressValidated) && dgram.size < maxDatagram &&
-      (dgram.get! 0 &&& 0xf0 == 0xc0) && c.amplificationAllowance ≥ maxDatagram then
-    dgram := dgram ++ ⟨Array.replicate (maxDatagram - dgram.size) 0⟩
+  if parts.isEmpty then return (c, none)
+  -- A client pads every datagram with an Initial in it, a server those with an ack-eliciting
+  -- Initial, to 1200 bytes (RFC 9000 §14.1).
+  let pad := parts.any fun (sp, _, b) => sp == .initial && (c.isClient || b.eliciting)
+  let mut dgram := ByteArray.empty
+  for h : i in [0:parts.size] do
+    let (sp, keys, b) := parts[i]
+    let target := if pad && i + 1 == parts.size then limit - min limit dgram.size else 0
+    let (c', pkt) := c.sealPacket now sp keys b target
+    c := c'
+    dgram := dgram ++ pkt
+    -- The client drops Initial keys once it sends a Handshake packet (RFC 9001 §4.9.1).
+    if c.isClient && sp == .handshake then c := c.discardSpace .initial
   pure ({ c with bytesSent := c.bytesSent + dgram.size }, some dgram)
 
 /-! ## Timers -/

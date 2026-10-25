@@ -101,6 +101,8 @@ def deliver (sim : Sim) (toServer : Bool) (d : ByteArray) : Sim :=
     | none =>
       match parseHeader d 0 0 with
       | some (.long .initial _ dcid scid _ _, _) =>
+        -- As a real server: Initials in datagrams under 1200 bytes are dropped.
+        if d.size < maxDatagram then { sim with dropped := sim.dropped + 1 } else
         let seed : Vector UInt8 32 := Vector.ofFn fun i => UInt8.ofNat (200 + i.val)
         let s := Conn.newServer {} serverTls seed ⟨#[7, 7, 7, 7, 7, 7, 7, 7]⟩ dcid scid sim.now
         { sim with server := some (echo (s.recv sim.now d)) }
