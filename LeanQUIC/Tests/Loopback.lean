@@ -110,6 +110,68 @@ def deliver (retry : Bool) (sim : Sim) (toServer : Bool) (d : ByteArray) : Sim :
       | .accept s _ => { sim with server := some (echo (s.recv sim.now d)) }
   else { sim with client := sim.client.recv sim.now d }
 
+/-- A client and server connected over a clean network, and nothing left in flight. -/
+def connected : IO Sim := do
+  let cseed : Vector UInt8 32 := Vector.ofFn fun i => UInt8.ofNat (i.val + 40)
+  let client ← match Conn.newClient {} clientTls cseed ⟨#[1, 2, 3, 4, 5, 6, 7, 8]⟩
+      ⟨#[9, 8, 7, 6, 5, 4, 3, 2]⟩ 1000000 with
+    | .ok c => pure c
+    | .error a => throw (IO.userError s!"client: {repr a}")
+  let mut sim : Sim := { now := 1000000, rng := { s := 1 }, client }
+  for _ in [0:100] do
+    sim := flush ⟨0, 0, 0⟩ sim
+    if sim.wire.isEmpty && sim.client.isEstablished && (sim.server.any (·.isEstablished)) then break
+    sim := { sim with now := (sim.wire.map (·.1)).foldl min (sim.now + 1000) }
+    let (due, later) := sim.wire.partition (·.1 ≤ sim.now)
+    sim := { sim with wire := later }
+    for (_, toServer, d) in due do
+      sim := deliver false sim toServer d
+  pure sim
+
+/-- Every datagram a connection has to send now. -/
+def drain (c : Conn) (now : Nat) : Conn × Array ByteArray := Id.run do
+  let mut c := c
+  let mut out := #[]
+  for _ in [0:1000] do
+    let (c', d) := c.poll now
+    c := c'
+    match d with
+    | some d => out := out.push d
+    | none => break
+  (c, out)
+
+/-- Delayed acknowledgments (RFC 9000 §13.2): a receiver handed in-order packets one at a time
+acknowledges every second one, and a lone packet only once `max_ack_delay` has passed. -/
+def ackChecks : IO Nat := do
+  let sim ← connected
+  let some srv := sim.server | throw (IO.userError "no server")
+  let now := sim.now + 100000
+  let mut failed := 0
+  -- Packets delivered and answered one by one.
+  let (c, id) := sim.client.openStream
+  let some id := id | throw (IO.userError "no stream")
+  let (cl, ds) := drain ((c.write id (pattern 11000))) now
+  let mut s := srv
+  for d in ds do
+    s := (drain (s.recv now d) now).1
+  let acks := s.acksSent - srv.acksSent
+  let okEvery := ds.size ≥ 8 && acks == ds.size / 2
+  IO.println s!"  {if okEvery then "ok  " else "FAIL"}  {ds.size} packets in order: {acks} ACKs"
+  if !okEvery then failed := failed + 1
+  -- One more packet on its own: no ACK until max_ack_delay.
+  let (c2, id2) := cl.openStream
+  let some id2 := id2 | throw (IO.userError "no stream")
+  let (_, one) := drain ((c2.write id2 (pattern 10)).finish id2) now
+  let s0 := (drain s now).1
+  let (s1, out1) := drain (one.foldl (fun s d => s.recv now d) s0) now
+  let deadline := s1.nextTimeout
+  let (s2, out2) := drain (s1.onTimeout (now + 25000)) (now + 25000)
+  let okDelay := out1.isEmpty && deadline == some (now + 25000) && out2.size == 1 &&
+    s2.acksSent == s0.acksSent + 1
+  IO.println s!"  {if okDelay then "ok  " else "FAIL"}  a lone packet: {out1.size} datagrams at once, deadline +{(deadline.getD now) - now} µs, {out2.size} at the deadline"
+  if !okDelay then failed := failed + 1
+  pure failed
+
 def decision : Endpoint.Decision → String
   | .drop => "drop"
   | .retry _ => "retry"
@@ -154,6 +216,8 @@ structure Outcome where
   ok : Bool
   detail : String
   millis : Nat
+  /-- ACK frames sent and ack-eliciting packets received, by the client and by the server. -/
+  acks : (Nat × Nat) × (Nat × Nat) := ((0, 0), (0, 0))
 
 /-- Run the client application: payloads of `size` bytes on `streams` streams in turn. -/
 def runTransfer (net : Net) (size streams : Nat) (seed : Nat) (retry : Bool) : IO Outcome := do
@@ -219,13 +283,16 @@ def runTransfer (net : Net) (size streams : Nat) (seed : Nat) (retry : Bool) : I
   | some f => pure { ok := false, detail := f, millis := t1 - t0 }
   | none =>
     if done == streams then
-      pure { ok := true, millis := t1 - t0,
-             detail := s!"{size * streams} bytes, {sim.sentDatagrams} datagrams ({sim.dropped} dropped), {sim.retries} Retry, {simulated} ms simulated" }
+      let srv := sim.server.map (fun s => (s.acksSent, s.elicitingRecv)) |>.getD (0, 0)
+      let cli := (sim.client.acksSent, sim.client.elicitingRecv)
+      pure { ok := true, millis := t1 - t0, acks := (cli, srv),
+             detail := s!"{size * streams} bytes, {sim.sentDatagrams} datagrams ({sim.dropped} dropped), {sim.retries} Retry, {simulated} ms simulated, ACKs {cli.1}/{cli.2} client, {srv.1}/{srv.2} server" }
     else pure { ok := false, millis := t1 - t0,
                 detail := s!"stalled after {done} streams, established {sim.client.isEstablished}, {simulated} ms simulated" }
 
 def main : IO UInt32 := do
   let mut failed ← tokenChecks
+  failed := failed + (← ackChecks)
   let cases : List (String × Net × Nat × Nat) := [
     ("clean, 1 byte", ⟨0, 0, 0⟩, 1, 1),
     ("clean, empty stream", ⟨0, 0, 0⟩, 0, 1),
