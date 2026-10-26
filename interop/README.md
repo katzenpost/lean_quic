@@ -77,5 +77,6 @@ The Lean client appends ` keyupdates=<count>`, and both Lean endpoints take
 
 prints `READY`, relays datagrams, drops P% and delays R% behind later ones in
 both directions. On SIGTERM it prints
-`relayed=… dropped=… reordered=… retry=…` to stderr, where `retry` counts
-QUIC v1 Retry packets from the server.
+`relayed=… dropped=… reordered=… retry=… rebinds=…` to stderr, where `retry`
+counts QUIC v1 Retry packets from the server and `rebinds` the moves to a new
+port.
