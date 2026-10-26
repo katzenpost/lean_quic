@@ -1,4 +1,4 @@
-.PHONY: build test interop
+.PHONY: build test axioms interop
 
 build:
 	lake build LeanQUIC LeanQUIC.Tests.Vectors LeanQUIC.Tests.Recovery LeanQUIC.Tests.Buffers \
@@ -10,6 +10,9 @@ test: build
 	lake exe LeanQUIC.Tests.Buffers
 	lake exe LeanQUIC.Tests.Loopback
 	lake exe example_sansio
+
+axioms: build
+	./scripts/check-axioms.sh
 
 interop: build
 	cd interop && LEAN_SERVER=$(CURDIR)/.lake/build/bin/quic_echo_server \

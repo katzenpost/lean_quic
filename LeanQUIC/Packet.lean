@@ -34,14 +34,14 @@ def initialSalt : ByteArray := ⟨#[0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0x
 structure Keys where
   suite  : Suite
   key    : suite.cipherSuite.aead.Key
-  iv     : ByteArray
+  iv     : Vector UInt8 12
   hp     : ByteArray
   secret : ByteArray
 
 def Keys.ofSecret (suite : Suite) (secret : ByteArray) : Keys :=
   let cs := suite.cipherSuite
   let pk := quicKeys secret cs.aead.keySize
-  { suite, key := cs.key pk.key, iv := pk.iv, hp := pk.hp, secret }
+  { suite, key := cs.key pk.key, iv := toVecN 12 pk.iv, hp := pk.hp, secret }
 
 /-- The client's and the server's Initial secrets, from the client's first Destination
 Connection ID. -/
@@ -58,8 +58,31 @@ def Keys.next (k : Keys) : Keys :=
   { Keys.ofSecret k.suite (LeanTLS.KeySchedule.quicNextSecret k.secret) with hp := k.hp }
 
 /-- The IV with the packet number, left-padded to 12 bytes, XORed in (RFC 9001 §5.3). -/
-def nonce (iv : ByteArray) (pn : Nat) : Vector UInt8 12 :=
-  Vector.ofFn fun i => iv.get! i.val ^^^ UInt8.ofNat (pn >>> (8 * (11 - i.val)))
+def nonce (iv : Vector UInt8 12) (pn : Nat) : Vector UInt8 12 :=
+  Vector.ofFn fun i => iv[i] ^^^ UInt8.ofNat (pn >>> (8 * (11 - i.val)))
+
+/-- Numbers that agree in their low `k` bytes agree modulo `2^(8k)`. -/
+theorem mod_eq_of_bytes {a b : Nat} : ∀ k : Nat,
+    (∀ j < k, (a >>> (8 * j)) % 256 = (b >>> (8 * j)) % 256) → a % 2 ^ (8 * k) = b % 2 ^ (8 * k)
+  | 0, _ => by simp [Nat.mod_one]
+  | k + 1, h => by
+    have ih := mod_eq_of_bytes k fun j hj => h j (by omega)
+    have hk := h k (by omega)
+    simp only [Nat.shiftRight_eq_div_pow] at hk
+    rw [show 8 * (k + 1) = 8 * k + 8 by omega, Nat.pow_add, Nat.mod_mul, Nat.mod_mul (x := b), ih, hk]
+
+/-- Below `2^96` a packet number is all in the nonce: one IV never gives two packet numbers the
+same nonce. -/
+theorem nonce_injective (iv : Vector UInt8 12) {a b : Nat} (ha : a < 2 ^ 96) (hb : b < 2 ^ 96)
+    (h : nonce iv a = nonce iv b) : a = b := by
+  have bytes : ∀ j < 12, (a >>> (8 * j)) % 256 = (b >>> (8 * j)) % 256 := by
+    intro j hj
+    have e := congrArg (fun v : Vector UInt8 12 => v[11 - j]'(by omega)) h
+    simp only [nonce, Vector.getElem_ofFn] at e
+    have e := congrArg UInt8.toNat ((UInt8.xor_right_inj _).mp e)
+    simpa [show 11 - (11 - j) = j by omega] using e
+  have := mod_eq_of_bytes 12 bytes
+  rwa [Nat.mod_eq_of_lt ha, Nat.mod_eq_of_lt hb] at this
 
 def sealPayload (k : Keys) (pn : Nat) (header payload : ByteArray) : ByteArray :=
   k.suite.cipherSuite.aead.encrypt k.key (k.suite.cipherSuite.nonce (nonce k.iv pn)) header payload
