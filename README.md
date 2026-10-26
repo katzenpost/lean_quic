@@ -35,8 +35,8 @@ CI, so they stay in step with the code.
 
 ### A server
 
-`runServer` listens on a UDP socket, sends every new client a Retry (as katzenpost's servers do),
-and calls your application after each event on a connection. The application here answers each
+`runServer` listens on a UDP socket, sends every new client a Retry (as katzenpost's servers do)
+whose token expires after 10 seconds, and calls your application after each event on a connection. The application here answers each
 stream with `hello, ` and whatever the client sent:
 
 ```lean
@@ -187,4 +187,5 @@ make interop    # against quic-go through katzenpost's own QUIC transport, see i
   examples. `testdata/rfc9001_appendix_a.json` is extracted from the RFC text by
   `scripts/extract_rfc9001.py`.
 * `LeanQUIC.Tests.Loopback`: a client and a server connection in process through a simulated
-  network with loss, reordering and duplication, transferring up to 3 MB.
+  network with loss, reordering and duplication, transferring up to 3 MB; and Retry tokens
+  accepted while fresh, dropped once expired or from another address.
