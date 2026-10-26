@@ -199,6 +199,46 @@ def keyChecks : IO Nat := do
   if !counted then failed := failed + 1
   pure failed
 
+def decision : Endpoint.Decision → String
+  | .drop => "drop"
+  | .retry _ => "retry"
+  | .accept _ _ => "accept"
+
+/-- Retry tokens: a client's second Initial is accepted while its token is fresh, and dropped once
+the token has expired, before it was issued, or from another address. -/
+def tokenChecks : IO Nat := do
+  let cfg := endpoint true
+  let addr := "127.0.0.1:1".toUTF8
+  let fresh : ByteArray := ⟨#[7, 7, 7, 7, 7, 7, 7, 7]⟩
+  let seed : Vector UInt8 32 := Vector.ofFn fun i => UInt8.ofNat (200 + i.val)
+  let t := 5_000_000
+  let client ← match Conn.newClient {} clientTls seed ⟨#[1, 2, 3, 4, 5, 6, 7, 8]⟩
+      ⟨#[9, 8, 7, 6, 5, 4, 3, 2]⟩ t with
+    | .ok c => pure c
+    | .error a => throw (IO.userError s!"client: {repr a}")
+  let (client, some first) := client.poll t | throw (IO.userError "no Initial")
+  let .retry pkt := Endpoint.onUnknown cfg addr first t fresh seed
+    | throw (IO.userError "no Retry")
+  let (_, some second) := (client.recv (t + 10_000) pkt).poll (t + 10_000)
+    | throw (IO.userError "no Initial after Retry")
+  let odcid := (first.extract 6 (6 + (first.get! 5).toNat))
+  let token := Endpoint.makeToken cfg.tokenKey addr odcid fresh t
+  let flipped := token.set! (1 + odcid.size + 7) (token.get! (1 + odcid.size + 7) ^^^ 1)
+  let cases : List (String × String × String) := [
+    ("fresh token", decision (Endpoint.onUnknown cfg addr second (t + 1_000_000) fresh seed), "accept"),
+    ("token at its lifetime", decision (Endpoint.onUnknown cfg addr second (t + cfg.tokenLifetime) fresh seed), "accept"),
+    ("expired token", decision (Endpoint.onUnknown cfg addr second (t + cfg.tokenLifetime + 1) fresh seed), "drop"),
+    ("token from the future", decision (Endpoint.onUnknown cfg addr second (t - 1) fresh seed), "drop"),
+    ("token from another address", decision (Endpoint.onUnknown cfg "127.0.0.1:2".toUTF8 second (t + 1000) fresh seed), "drop"),
+    ("token checks", toString (Endpoint.checkToken cfg.tokenKey addr fresh token t cfg.tokenLifetime == some odcid), "true"),
+    ("token with a flipped issue time", toString (Endpoint.checkToken cfg.tokenKey addr fresh flipped t cfg.tokenLifetime).isSome, "false")]
+  let mut failed := 0
+  for (name, got, want) in cases do
+    let ok := got == want
+    IO.println s!"  {if ok then "ok  " else "FAIL"}  {name}: {got}"
+    if !ok then failed := failed + 1
+  pure failed
+
 structure Outcome where
   ok : Bool
   detail : String
@@ -281,7 +321,8 @@ def runTransfer (net : Net) (size streams : Nat) (seed : Nat) (retry : Bool)
                 detail := s!"stalled after {done} streams, established {sim.client.isEstablished}, {simulated} ms simulated" }
 
 def main : IO UInt32 := do
-  let mut failed ← ackChecks
+  let mut failed ← tokenChecks
+  failed := failed + (← ackChecks)
   failed := failed + (← keyChecks)
   let cases : List (String × Net × Nat × Nat) := [
     ("clean, 1 byte", ⟨0, 0, 0⟩, 1, 1),
