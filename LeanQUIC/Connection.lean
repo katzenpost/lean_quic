@@ -81,7 +81,12 @@ structure SpaceState where
   largestRecvTime : Nat := 0
   /-- Received packet numbers as inclusive ranges, largest first. -/
   recvRanges : List (Nat × Nat) := []
+  /-- An acknowledgment is due now. -/
   ackPending : Bool := false
+  /-- Ack-eliciting packets received since the last acknowledgment sent. -/
+  unackedEliciting : Nat := 0
+  /-- When a delayed acknowledgment is due (RFC 9000 §13.2.1). -/
+  ackDeadline : Option Nat := none
   largestAcked : Option Nat := none
   sent : Std.HashMap Nat (Array Sent) := {}
   cryptoSend : Buffers.Send := Buffers.Send.init
@@ -130,6 +135,8 @@ structure Config where
   maxData : Nat := 16 * 1024 * 1024
   maxStreamData : Nat := 4 * 1024 * 1024
   maxStreamsBidi : Nat := 100
+  /-- How long we may delay an acknowledgment, in milliseconds (`max_ack_delay`). -/
+  maxAckDelay : Nat := 25
 
 structure Conn where
   isClient : Bool
@@ -168,6 +175,9 @@ structure Conn where
   addressValidated : Bool
   bytesRecv : Nat := 0
   bytesSent : Nat := 0
+  /-- Ack-eliciting packets received, and ACK frames sent. -/
+  elicitingRecv : Nat := 0
+  acksSent : Nat := 0
   idleDeadline : Option Nat := none
   probe : Option (Space × Nat) := none
   phase : Phase := .handshaking
@@ -207,6 +217,7 @@ def localTransportParams (cfg : Config) (isClient : Bool) (localCid originalDcid
     initialMaxStreamDataUni := 0,
     initialMaxStreamsBidi := cfg.maxStreamsBidi,
     initialMaxStreamsUni := 0,
+    maxAckDelay := cfg.maxAckDelay,
     activeConnectionIdLimit := 2,
     initialSourceConnectionId := some localCid,
     originalDestinationConnectionId := if isClient then none else some originalDcid,
@@ -416,12 +427,23 @@ def onPacket (c : Conn) (now : Nat) (sp : Space) (pn : Nat) (payload : ByteArray
       | .error (e, why) => return c.fail now e why
       if c.isClosed then return c
     let eliciting := frames.any (·.ackEliciting)
-    c := c.modifySpace sp fun s =>
+    -- RFC 9000 §13.2: Initial and Handshake packets, and packets out of order or after a gap, are
+    -- acknowledged at once; other 1-RTT packets every second one, or after `max_ack_delay`.
+    let s := c.space sp
+    let inOrder := match s.largestRecv with | some l => pn == l + 1 | none => true
+    let count := if eliciting then s.unackedEliciting + 1 else s.unackedEliciting
+    let ackNow := eliciting && (sp != .application || !inOrder || count ≥ 2)
+    let delayUntil := now + c.config.maxAckDelay * 1000
+    c := c.setSpace sp
       { s with recvRanges := addRange s.recvRanges pn,
                largestRecv := some (max pn (s.largestRecv.getD 0)),
                largestRecvTime := if pn ≥ s.largestRecv.getD 0 then now else s.largestRecvTime,
-               ackPending := s.ackPending || eliciting }
-    pure { c with idleDeadline := some (now + c.idleTimeoutUs) }
+               ackPending := s.ackPending || ackNow,
+               unackedEliciting := count,
+               ackDeadline := if eliciting && !ackNow then
+                 some (min delayUntil (s.ackDeadline.getD delayUntil)) else s.ackDeadline }
+    pure { c with idleDeadline := some (now + c.idleTimeoutUs),
+                  elicitingRecv := c.elicitingRecv + (if eliciting then 1 else 0) }
 
 /-- The client's response to a Retry (RFC 9000 §17.2.5.2): new Initial keys and the token, and the
 ClientHello again. -/
@@ -504,6 +526,11 @@ def ackFrame (s : SpaceState) (now : Nat) (sp : Space) : Option Frame :=
   let delay := if sp == .application then (now - s.largestRecvTime) / 8 else 0
   some (.ack s.recvRanges delay)
 
+/-- An acknowledgment went out: nothing is pending until the next ack-eliciting packet. -/
+def ackSent (c : Conn) (sp : Space) : Conn :=
+  { c.modifySpace sp (fun s => { s with ackPending := false, unackedEliciting := 0, ackDeadline := none })
+    with acksSent := c.acksSent + 1 }
+
 structure Built where
   frames : Array Frame := #[]
   sent : Array Sent := #[]
@@ -526,7 +553,7 @@ def buildFrames (c : Conn) (now : Nat) (sp : Space) (budget : Nat) (allowData : 
     if let some f := ackFrame s now sp then
       if f.encode.size ≤ budget then
         b := b.add f
-        c := c.modifySpace sp fun s => { s with ackPending := false }
+        c := c.ackSent sp
   if !allowData then return (c, b)
   if let .closing _ _ _ := c.phase then return (c, b)
   -- CRYPTO
@@ -570,6 +597,12 @@ def buildFrames (c : Conn) (now : Nat) (sp : Space) (budget : Nat) (allowData : 
           b := b.add (.stream id off data fin) (some (.stream id off data.size fin))
   if c.probe.isSome && !b.eliciting && b.size + 1 ≤ budget then
     b := b.add .ping
+  -- A delayed acknowledgment rides along with anything else being sent.
+  if b.eliciting && (c.space sp).unackedEliciting > 0 then
+    if let some f := ackFrame (c.space sp) now sp then
+      if b.size + f.encode.size ≤ budget then
+        b := b.add f
+        c := c.ackSent sp
   pure (c, b)
 
 /-- Header bytes for a packet in a space, its packet number length included. -/
@@ -678,7 +711,7 @@ def closeDeadline (c : Conn) : Option Nat :=
 
 def nextTimeout (c : Conn) : Option Nat :=
   if c.isClosed then none else
-  [c.recovery.lossDetectionDeadline, c.idleDeadline, c.closeDeadline].filterMap id |>.foldl
+  [c.recovery.lossDetectionDeadline, c.idleDeadline, c.closeDeadline, c.app.ackDeadline].filterMap id |>.foldl
     (fun acc d => some (match acc with | some a => min a d | none => d)) none
 
 def onTimeout (c : Conn) (now : Nat) : Conn := Id.run do
@@ -686,6 +719,10 @@ def onTimeout (c : Conn) (now : Nat) : Conn := Id.run do
     if now ≥ d then return { c with phase := .closed }
   if let some d := c.idleDeadline then
     if now ≥ d then return { c with phase := .closed, closeReason := c.closeReason <|> some (true, 0, "idle timeout") }
+  let c := match c.app.ackDeadline with
+    | some d => if now ≥ d then c.modifySpace .application fun s =>
+        { s with ackPending := true, ackDeadline := none } else c
+    | none => c
   match c.recovery.lossDetectionDeadline with
   | some d =>
     if now < d then return c
