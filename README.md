@@ -15,6 +15,9 @@ Lean's own `Std.Async.UDP`.
 * `VarInt`, `Packet`, `Frame`, `TransportParams`: the wire format and packet protection.
   `Packet.openPayload_sealPayload` carries the AEAD's correctness over to packets and
   `Packet.applyMask_applyMask` shows header protection undoes itself.
+* `Sealer`: a space's write keys and packet number counter, the only way to seal a packet.
+  `Sealer.run_nonces_nodup` proves that, through any sequence of key changes, no two packets of
+  a space get the same nonce.
 * `Recovery`: loss detection and NewReno congestion control (RFC 9002), with the congestion
   window's lower bound as a proof field of its state.
 * `Buffers`: stream and CRYPTO reassembly and retransmission, its interval sets carrying their
@@ -174,6 +177,7 @@ server read ping on stream 0
 
 ```bash
 make test       # RFC 9000/9001 vectors, recovery, buffers, in-process transfers
+make axioms     # every theorem depends on Lean's own axioms only
 make interop    # against quic-go through katzenpost's own QUIC transport, see interop/
 ```
 

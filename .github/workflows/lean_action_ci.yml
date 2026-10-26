@@ -24,6 +24,8 @@ jobs:
           ./.lake/build/bin/LeanQUIC-Tests-Buffers
           ./.lake/build/bin/LeanQUIC-Tests-Loopback
           ./.lake/build/bin/example_sansio
+      - name: Check the theorems use no axioms beyond Lean's own
+        run: ./scripts/check-axioms.sh
       - name: Check the test vectors match their recorded hashes
         run: sha256sum -c testdata/rfc9001_appendix_a.json.sha256
       - uses: actions/setup-go@v5

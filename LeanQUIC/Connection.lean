@@ -4,7 +4,7 @@ SPDX-License-Identifier: AGPL-3.0-only
 -/
 
 import Std.Data.HashMap
-import LeanQUIC.Packet
+import LeanQUIC.Sealer
 import LeanQUIC.Frame
 import LeanQUIC.TransportParams
 import LeanQUIC.Recovery
@@ -75,7 +75,8 @@ inductive Sent where
   | control (f : Frame)
 
 structure SpaceState where
-  nextPn : Nat := 0
+  /-- The write keys and the next packet number. -/
+  sealer : Sealer := Sealer.init
   largestRecv : Option Nat := none
   largestRecvTime : Nat := 0
   /-- Received packet numbers as inclusive ranges, largest first. -/
@@ -86,8 +87,10 @@ structure SpaceState where
   cryptoSend : Buffers.Send := Buffers.Send.init
   cryptoRecv : Buffers.Recv := Buffers.Recv.initCrypto cryptoCap
   readKeys : Option Keys := none
-  writeKeys : Option Keys := none
   discarded : Bool := false
+
+def SpaceState.nextPn (s : SpaceState) : Nat := s.sealer.nextPn
+def SpaceState.writeKeys (s : SpaceState) : Option Keys := s.sealer.keys
 
 /-- Add `pn` to inclusive ranges kept largest first, merging neighbours; at most 32 ranges. -/
 def addRange (rs : List (Nat × Nat)) (pn : Nat) : List (Nat × Nat) :=
@@ -230,12 +233,13 @@ def close (c : Conn) (now : Nat) : Conn :=
 /-- Install the secrets TLS produced for a level. -/
 def install (c : Conn) (level : Level) (suite : Suite) (s : Secrets) : Conn :=
   c.modifySpace (Space.ofLevel level) fun sp =>
-    { sp with readKeys := some (Keys.ofSecret suite s.read), writeKeys := some (Keys.ofSecret suite s.write) }
+    { sp with readKeys := some (Keys.ofSecret suite s.read),
+              sealer := sp.sealer.rekey (Keys.ofSecret suite s.write) }
 
 def discardSpace (c : Conn) (sp : Space) : Conn :=
   if (c.space sp).discarded then c else
   let c := c.modifySpace sp fun s =>
-    { s with readKeys := none, writeKeys := none, discarded := true, sent := {}, ackPending := false,
+    { s with readKeys := none, sealer := s.sealer.discard, discarded := true, sent := {}, ackPending := false,
              cryptoSend := Buffers.Send.init }
   { c with recovery := c.recovery.discardSpace sp }
 
@@ -431,7 +435,7 @@ def onRetry (c : Conn) (now : Nat) (scid token pkt : ByteArray) : Conn :=
     let c := { c with remoteCid := scid, retrySource := some scid, token,
                       recovery := c.recovery.discardSpace .initial }
     let _ := now
-    c.setSpace .initial { s with writeKeys := some ck, readKeys := some sk, sent := {},
+    c.setSpace .initial { s with sealer := s.sealer.rekey ck, readKeys := some sk, sent := {},
                                  cryptoSend := s.cryptoSend.onLost 0 sentAll false }
 
 /-- A datagram from the peer. -/
@@ -484,7 +488,7 @@ def recv (c : Conn) (now : Nat) (dgram : ByteArray) : Conn := Id.run do
           let nk := keys.next
           if let some o := openPacket nk false pkt pnOffset c.app.largestRecv then
             if (o.firstByte &&& 0x04 != 0) != c.keyPhase then
-              c := c.modifySpace .application fun s => { s with readKeys := some nk, writeKeys := some wk.next }
+              c := c.modifySpace .application fun s => { s with readKeys := some nk, sealer := s.sealer.rekey wk.next }
               c := { c with keyPhase := !c.keyPhase }
               c := c.onPacket now .application o.pn o.payload
   pure c
@@ -576,27 +580,31 @@ def headerFor (c : Conn) (sp : Space) (pn pnLen payloadLen : Nat) : ByteArray :=
   | .handshake => longHeader .handshake c.remoteCid c.localCid ByteArray.empty pn pnLen payloadLen
   | .application => shortHeader c.remoteCid c.keyPhase pn pnLen
 
-/-- Seal a packet from built frames; with `target` nonzero, padded to exactly `target` bytes. -/
-def sealPacket (c : Conn) (now : Nat) (sp : Space) (keys : Keys) (b : Built) (target : Nat) :
+/-- Seal a packet from built frames with the space's sealer; with `target` nonzero, padded to
+exactly `target` bytes. A space out of packet numbers closes the connection. -/
+def sealPacket (c : Conn) (now : Nat) (sp : Space) (b : Built) (target : Nat) :
     Conn × ByteArray :=
   let s := c.space sp
-  let pn := s.nextPn
-  let pnLen := pnLength pn s.largestAcked
-  -- The header's size does not depend on the payload's: Length is always two bytes.
-  let hdrSize := (c.headerFor sp pn pnLen 0).size
-  let minPayload := max (target - min target (hdrSize + tagSize)) (4 - min 4 pnLen)
-  let payload := (b.frames.foldl (fun acc f => acc ++ f.encode) ByteArray.empty)
-  let payload := if payload.size < minPayload then
-    payload ++ ⟨Array.replicate (minPayload - payload.size) 0⟩ else payload
-  let hdr := c.headerFor sp pn pnLen payload.size
-  let pkt := protect keys (sp != .application) hdr pn pnLen payload
-  let inFlight := b.eliciting || target > 0
-  let sent := if b.sent.isEmpty && !b.eliciting then s.sent else s.sent.insert pn b.sent
-  let c := c.setSpace sp { s with nextPn := pn + 1, sent }
-  let record : Recovery.SentPacket :=
-    { pn, timeSent := now, ackEliciting := b.eliciting, inFlight, size := pkt.size }
-  let c := { c with recovery := c.recovery.onPacketSent sp record }
-  (c, pkt)
+  let frames := b.frames.foldl (fun acc f => acc ++ f.encode) ByteArray.empty
+  let build (pn : Nat) : ByteArray × Nat × ByteArray :=
+    let pnLen := pnLength pn s.largestAcked
+    -- The header's size does not depend on the payload's: Length is always two bytes.
+    let hdrSize := (c.headerFor sp pn pnLen 0).size
+    let minPayload := max (target - min target (hdrSize + tagSize)) (4 - min 4 pnLen)
+    let payload := if frames.size < minPayload then
+      frames ++ ⟨Array.replicate (minPayload - frames.size) 0⟩ else frames
+    (c.headerFor sp pn pnLen payload.size, pnLen, payload)
+  match s.sealer.send (sp != .application) build with
+  | none =>
+    ({ c with phase := .closed, closeReason := c.closeReason <|> some (true, 0, "packet numbers exhausted") },
+     ByteArray.empty)
+  | some (sealer, pn, pkt) =>
+    let inFlight := b.eliciting || target > 0
+    let sent := if b.sent.isEmpty && !b.eliciting then s.sent else s.sent.insert pn b.sent
+    let c := c.setSpace sp { s with sealer, sent }
+    let record : Recovery.SentPacket :=
+      { pn, timeSent := now, ackEliciting := b.eliciting, inFlight, size := pkt.size }
+    ({ c with recovery := c.recovery.onPacketSent sp record }, pkt)
 
 def headerOverhead (c : Conn) (sp : Space) : Nat :=
   match sp with
@@ -613,23 +621,23 @@ def poll (c : Conn) (now : Nat) : Conn × Option ByteArray := Id.run do
     if sent then return (c, none)
     let sp : Space := if c.app.writeKeys.isSome && c.isEstablished then .application
       else if c.handshake.writeKeys.isSome then .handshake else .initial
-    let some keys := (c.space sp).writeKeys | return ({ c with phase := .closing d f true }, none)
+    if (c.space sp).writeKeys.isNone then return ({ c with phase := .closing d f true }, none)
     let f := match f, sp with
       | .connectionClose true _ _ _, .application => f
       | .connectionClose _ code ft r, _ => .connectionClose false code ft r
       | _, _ => f
-    let (c, pkt) := c.sealPacket now sp keys (Built.add {} f) 0
+    let (c, pkt) := c.sealPacket now sp (Built.add {} f) 0
+    if c.isClosed then return (c, none)
     return ({ c with phase := .closing d f true }, some pkt)
   | _ => pure ()
   let mut c := c
   let limit := min maxDatagram c.amplificationAllowance
   let cwndOk := c.recovery.sendAllowance ≥ maxDatagram || c.probe.isSome
   -- First the frames of each packet, then the packets, so the last can pad the datagram.
-  let mut parts : Array (Space × Keys × Built) := #[]
+  let mut parts : Array (Space × Built) := #[]
   let mut used := 0
   for sp in [Space.initial, .handshake, .application] do
-    let some keys := (c.space sp).writeKeys | continue
-    if (c.space sp).discarded then continue
+    if (c.space sp).writeKeys.isNone || (c.space sp).discarded then continue
     let overhead := c.headerOverhead sp + tagSize
     if used + overhead + 8 > limit then continue
     let budget := limit - used - overhead
@@ -638,7 +646,7 @@ def poll (c : Conn) (now : Nat) : Conn × Option ByteArray := Id.run do
     let (c1, b) := c0.buildFrames now sp budget cwndOk
     c := if probeHere || c.probe.isNone then c1 else { c1 with probe := c.probe }
     if b.frames.isEmpty then continue
-    parts := parts.push (sp, keys, b)
+    parts := parts.push (sp, b)
     used := used + overhead + b.size
     if probeHere then
       c := { c with probe := match c.probe with
@@ -647,13 +655,14 @@ def poll (c : Conn) (now : Nat) : Conn × Option ByteArray := Id.run do
   if parts.isEmpty then return (c, none)
   -- A client pads every datagram with an Initial in it, a server those with an ack-eliciting
   -- Initial, to 1200 bytes (RFC 9000 §14.1).
-  let pad := parts.any fun (sp, _, b) => sp == .initial && (c.isClient || b.eliciting)
+  let pad := parts.any fun (sp, b) => sp == .initial && (c.isClient || b.eliciting)
   let mut dgram := ByteArray.empty
   for h : i in [0:parts.size] do
-    let (sp, keys, b) := parts[i]
+    let (sp, b) := parts[i]
     let target := if pad && i + 1 == parts.size then limit - min limit dgram.size else 0
-    let (c', pkt) := c.sealPacket now sp keys b target
+    let (c', pkt) := c.sealPacket now sp b target
     c := c'
+    if c.isClosed then return (c, none)
     dgram := dgram ++ pkt
     -- The client drops Initial keys once it sends a Handshake packet (RFC 9001 §4.9.1).
     if c.isClient && sp == .handshake then c := c.discardSpace .initial
@@ -771,7 +780,7 @@ def newClient (cfg : Config) (tlsCfg : LeanTLS.Handshake.Client.Config) (seed : 
       originalDcid := dcid, recovery := Recovery.init true maxDatagram, localParams := params,
       nextLocalStream := 0, localMaxStreams := cfg.maxStreamsBidi, localMaxData := cfg.maxData,
       addressValidated := true, idleDeadline := some (now + cfg.idleTimeout * 1000) }
-  c := c.setSpace .initial { c.initial with writeKeys := some ck, readKeys := some sk }
+  c := c.setSpace .initial { c.initial with sealer := c.initial.sealer.rekey ck, readKeys := some sk }
   for o in outs do
     if let .send l d := o then
       c := c.modifySpace (Space.ofLevel l) fun sp => { sp with cryptoSend := sp.cryptoSend.write d }
@@ -792,7 +801,7 @@ def newServer (cfg : Config) (tlsCfg : LeanTLS.Handshake.Server.Config) (seed : 
       localParams := params, nextLocalStream := 1, localMaxStreams := cfg.maxStreamsBidi,
       localMaxData := cfg.maxData, addressValidated := retrySource.isSome,
       idleDeadline := some (now + cfg.idleTimeout * 1000) }
-  c.setSpace .initial { c.initial with writeKeys := some ck, readKeys := some sk }
+  c.setSpace .initial { c.initial with sealer := c.initial.sealer.rekey ck, readKeys := some sk }
 
 end Conn
 

@@ -145,6 +145,22 @@ def main : IO UInt32 := do
     ok r s!"round trip {byteArrayToHex (enc.extract 0 1)}" (back.map (·.toList.map (·.data)) == some [enc.data])
   ok r "ACK with an impossible range is refused" (Frame.parseAll (hex! "020a000105") |>.isNone)
 
+  IO.println "sealer"
+  let (ck, sk) := initialKeys (hex! "8394c8f03e515708")
+  let build (pn : Nat) : ByteArray × Nat × ByteArray :=
+    (shortHeader (hex! "0102030405060708") false pn 4, 4, ⟨Array.replicate 30 0⟩)
+  let steps := [Sealer.Step.send false build, .rekey ck, .send false build, .send false build,
+    .discard, .send false build, .rekey sk, .send false build]
+  let (s, pns) := Sealer.init.run steps
+  ok r "nothing is sealed without keys" ((Sealer.init.send false build).isNone)
+  ok r "packet numbers continue across rekeys" (pns == [0, 1, 2] && s.nextPn == 3)
+  ok r "nonces are distinct" ((pns.map (nonce ck.iv)).eraseDups.length == pns.length)
+  match Sealer.init.rekey ck |>.send false build with
+  | some (_, pn, pkt) =>
+    let (hdr, pnLen, payload) := build pn
+    ok r "send seals with protect" (pkt == protect ck false hdr pn pnLen payload)
+  | none => ok r "send seals with protect" false
+
   let n ← r.get
   IO.println (if n == 0 then "all vectors passed" else s!"{n} checks failed")
   pure (if n == 0 then 0 else 1)

@@ -1,6 +1,7 @@
 import LeanQUIC.VarInt
 import LeanQUIC.Error
 import LeanQUIC.Packet
+import LeanQUIC.Sealer
 import LeanQUIC.Frame
 import LeanQUIC.TransportParams
 import LeanQUIC.Recovery
