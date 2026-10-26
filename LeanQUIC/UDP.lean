@@ -130,18 +130,32 @@ partial def runClient {α : Type} (cfg : Config) (tls : LeanTLS.Handshake.Client
 structure Peer where
   addr : SocketAddress
   conn : Conn
+  /-- The connection IDs the endpoint gave the connection at first. -/
+  initial : List ByteArray
+  /-- The connection IDs that lead to it now. -/
   cids : List ByteArray
 
 structure Peers where
   conns : Std.HashMap Nat Peer := {}
-  /-- Both the client's original Destination Connection ID and ours lead to a connection. -/
+  /-- Every connection ID a connection uses, and the client's original Destination Connection ID,
+  lead to it. -/
   byCid : Std.HashMap ByteArray Nat := {}
   next : Nat := 0
+
+/-- Store connection `i`, routing its connection IDs as they stand now. -/
+def Peers.put (ps : Peers) (i : Nat) (p : Peer) : Peers :=
+  let want := (p.initial ++ p.conn.activeLocalCids).eraseDups
+  let byCid := p.cids.foldl (fun m c => if want.contains c then m else m.erase c) ps.byCid
+  { ps with conns := ps.conns.insert i { p with cids := want },
+            byCid := want.foldl (fun m c => m.insert c i) byCid }
 
 /-- Serve forever: connections are found by the Destination Connection ID of each datagram, and
 `app` is run on a connection after each of its events. -/
 partial def runServer (cfg : Endpoint.Config) (listen : SocketAddress)
     (app : Conn → Conn) (onReady : IO Unit) : IO Unit := do
+  -- One reset key for every connection, so the endpoint can reset ones it has lost.
+  let resetKey ← if cfg.quic.resetKey.isEmpty then randomBytes 32 else pure cfg.quic.resetKey
+  let cfg := { cfg with quic := { cfg.quic with resetKey } }
   let sock ← Socket.mk
   sock.bind listen
   onReady
@@ -153,7 +167,7 @@ partial def runServer (cfg : Endpoint.Config) (listen : SocketAddress)
         ps := { ps with conns := ps.conns.erase i, byCid := p.cids.foldl (·.erase ·) ps.byCid }
       else
         let c ← sendAll sock p.conn (some p.addr)
-        ps := { ps with conns := ps.conns.insert i { p with conn := c } }
+        ps := ps.put i { p with conn := c }
     let deadline := ps.conns.fold (fun acc _ p => match acc, p.conn.nextTimeout with
       | some a, some b => some (min a b) | none, b => b | a, none => a) none
     match ← waitEvent sock deadline with
@@ -161,7 +175,7 @@ partial def runServer (cfg : Endpoint.Config) (listen : SocketAddress)
       let now ← nowUs
       for (i, p) in ps.conns.toList do
         if p.conn.nextTimeout.any (· ≤ now) then
-          ps := { ps with conns := ps.conns.insert i { p with conn := app (p.conn.onTimeout now) } }
+          ps := ps.put i { p with conn := app (p.conn.onTimeout now) }
     | .datagram d (some addr) =>
       let now ← nowUs
       match parseHeader d 0 cidLength with
@@ -170,18 +184,18 @@ partial def runServer (cfg : Endpoint.Config) (listen : SocketAddress)
         match ps.byCid[dcid]?.bind (ps.conns[·]?) with
         | some p =>
           let i := ps.byCid[dcid]!
-          ps := { ps with conns := ps.conns.insert i { p with addr, conn := app (p.conn.recv now d) } }
+          ps := ps.put i { p with addr, conn := app (p.conn.recv now d) }
         | none =>
           let fresh ← (randomBytes cidLength : IO _)
           let seed ← (randomSeed : IO _)
           match Endpoint.onUnknown cfg (toString addr).toUTF8 d now fresh seed with
           | .drop => pure ()
           | .retry pkt => sock.send pkt (some addr)
+          | .reset pkt => sock.send pkt (some addr)
           | .accept c cids =>
             let c := app (c.recv now d)
             let i := ps.next
-            ps := { conns := ps.conns.insert i { addr, conn := c, cids },
-                    byCid := cids.foldl (fun m cid => m.insert cid i) ps.byCid, next := i + 1 }
+            ps := { ps with next := i + 1 }.put i { addr, conn := c, initial := cids, cids := [] }
       | none => pure ()
     | .datagram _ none => pure ()
     loop ps
