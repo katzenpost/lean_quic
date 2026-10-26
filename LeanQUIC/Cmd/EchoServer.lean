@@ -27,7 +27,10 @@ def main (args : List String) : IO UInt32 := do
   let some pin := spkiPin cert | IO.eprintln "certificate does not parse"; return 1
   let tls : LeanTLS.Handshake.Server.Config :=
     { alpn := "h3".toUTF8, transportParams := ByteArray.empty, signingKey := key, certificate := cert }
-  let cfg : Endpoint.Config := { tls, tokenKey := ← randomBytes 32, retry := !args.contains "--no-retry" }
+  let keyUpdate := ((argOf args "--key-update").bind String.toNat?).getD 0
+  let tokenKey ← randomBytes 32
+  let cfg : Endpoint.Config :=
+    { quic := { keyUpdateInterval := keyUpdate }, tls, tokenKey, retry := !args.contains "--no-retry" }
   runServer cfg listen echo do
     IO.println s!"SPKI-SHA256 {byteArrayToHex pin}"
     IO.println "READY"

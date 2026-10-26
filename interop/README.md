@@ -39,7 +39,9 @@ which adds lean-client to go-server, go-client to lean-server and, when both
 are set, lean-client to lean-server.
 
 Other variables: `SIZES`, `TIMEOUT` (seconds per client run, default 60),
-`LOSSY=0` to skip the proxy runs, `DROP` and `REORDER` (percent), `SEED`.
+`LOSSY=0` to skip the proxy runs, `DROP` and `REORDER` (percent), `SEED`, and
+`KEY_UPDATE=N` to have the Lean endpoints update their keys every `N` packets
+(`--key-update N`).
 
 ## CLI contract
 
@@ -62,6 +64,9 @@ fails with a non-zero exit and a message on stderr if the pin does not match,
 the group is not X25519MLKEM768 or the echo differs, and otherwise prints
 
     OK bytes=<N*K> group=X25519MLKEM768 suite=<cipher suite>
+
+The Lean client appends ` keyupdates=<count>`, and both Lean endpoints take
+`--key-update N` to start a key update every N packets.
 
 ## lossyproxy
 

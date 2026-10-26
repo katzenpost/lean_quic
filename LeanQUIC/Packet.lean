@@ -241,6 +241,9 @@ structure Opened where
   firstByte : UInt8
   payload : ByteArray
 
+/-- The key phase bit of a short header packet. -/
+def Opened.phaseBit (o : Opened) : Bool := o.firstByte &&& 0x04 != 0
+
 /-- Remove header protection and open one packet (`pkt` is exactly the packet). `largest` is the
 largest packet number received in the space. -/
 def openPacket (k : Keys) (long : Bool) (pkt : ByteArray) (pnOffset : Nat) (largest : Option Nat) :

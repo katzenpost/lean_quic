@@ -49,6 +49,8 @@ structure Sim where
   sentDatagrams : Nat := 0
   dropped : Nat := 0
   retries : Nat := 0
+  /-- Both sides' connection configuration. -/
+  cfg : LeanQUIC.Config := {}
 
 def pattern (n : Nat) : ByteArray := ⟨Array.ofFn fun i : Fin n => UInt8.ofNat (i.val % 251)⟩
 
@@ -95,8 +97,8 @@ def echo (c : Conn) : Conn := Id.run do
     c := c.retire id
   pure c
 
-def endpoint (retry : Bool) : Endpoint.Config :=
-  { tls := serverTls, retry, tokenKey := ⟨Array.replicate 32 3⟩ }
+def endpoint (retry : Bool) (quic : LeanQUIC.Config := {}) : Endpoint.Config :=
+  { quic, tls := serverTls, retry, tokenKey := ⟨Array.replicate 32 3⟩ }
 
 def deliver (retry : Bool) (sim : Sim) (toServer : Bool) (d : ByteArray) : Sim :=
   if toServer then
@@ -104,7 +106,7 @@ def deliver (retry : Bool) (sim : Sim) (toServer : Bool) (d : ByteArray) : Sim :
     | some s => { sim with server := some (echo (s.recv sim.now d)) }
     | none =>
       let seed : Vector UInt8 32 := Vector.ofFn fun i => UInt8.ofNat (200 + i.val)
-      match Endpoint.onUnknown (endpoint retry) "127.0.0.1:1".toUTF8 d sim.now ⟨#[7, 7, 7, 7, 7, 7, 7, 7]⟩ seed with
+      match Endpoint.onUnknown (endpoint retry sim.cfg) "127.0.0.1:1".toUTF8 d sim.now ⟨#[7, 7, 7, 7, 7, 7, 7, 7]⟩ seed with
       | .drop => { sim with dropped := sim.dropped + 1 }
       | .retry pkt => { sim with wire := sim.wire.push (sim.now + 10000, false, pkt), retries := sim.retries + 1 }
       | .accept s _ => { sim with server := some (echo (s.recv sim.now d)) }
@@ -172,6 +174,31 @@ def ackChecks : IO Nat := do
   if !okDelay then failed := failed + 1
   pure failed
 
+/-- Key update rules (RFC 9001 §6): no update before the handshake is confirmed, and a 1-RTT
+packet that fails authentication is counted. -/
+def keyChecks : IO Nat := do
+  let sim ← connected
+  let some srv := sim.server | throw (IO.userError "no server")
+  let now := sim.now + 100000
+  let mut failed := 0
+  let fresh ← match Conn.newClient {} clientTls (Vector.replicate 32 5) ⟨#[1, 2, 3, 4, 5, 6, 7, 8]⟩
+      ⟨#[9, 8, 7, 6, 5, 4, 3, 2]⟩ now with
+    | .ok c => pure c
+    | .error a => throw (IO.userError s!"client: {repr a}")
+  let early := (fresh.updateKeys now).keyUpdates == 0
+  IO.println s!"  {if early then "ok  " else "FAIL"}  no key update before the handshake is confirmed"
+  if !early then failed := failed + 1
+  let (c, id) := sim.client.openStream
+  let some id := id | throw (IO.userError "no stream")
+  let (_, ds) := drain ((c.write id (pattern 100)).finish id) now
+  let some d := ds[0]? | throw (IO.userError "no datagram")
+  let tampered := d.set! (d.size - 1) (d.get! (d.size - 1) ^^^ 1)
+  let s := srv.recv now tampered
+  let counted := s.authFailures == srv.authFailures + 1 && !s.isClosed
+  IO.println s!"  {if counted then "ok  " else "FAIL"}  a tampered 1-RTT packet counts as an authentication failure"
+  if !counted then failed := failed + 1
+  pure failed
+
 structure Outcome where
   ok : Bool
   detail : String
@@ -180,15 +207,16 @@ structure Outcome where
   acks : (Nat × Nat) × (Nat × Nat) := ((0, 0), (0, 0))
 
 /-- Run the client application: payloads of `size` bytes on `streams` streams in turn. -/
-def runTransfer (net : Net) (size streams : Nat) (seed : Nat) (retry : Bool) : IO Outcome := do
+def runTransfer (net : Net) (size streams : Nat) (seed : Nat) (retry : Bool)
+    (cfg : LeanQUIC.Config := {}) : IO Outcome := do
   let t0 ← IO.monoMsNow
   let cseed : Vector UInt8 32 := Vector.ofFn fun i => UInt8.ofNat (i.val + seed)
   let start := 1000000
-  let client ← match Conn.newClient {} clientTls cseed ⟨#[1, 2, 3, 4, 5, 6, 7, 8]⟩
+  let client ← match Conn.newClient cfg clientTls cseed ⟨#[1, 2, 3, 4, 5, 6, 7, 8]⟩
       ⟨#[9, 8, 7, 6, 5, 4, 3, 2]⟩ start with
     | .ok c => pure c
     | .error a => throw (IO.userError s!"client: {repr a}")
-  let mut sim : Sim := { now := start, rng := { s := seed }, client }
+  let mut sim : Sim := { now := start, rng := { s := seed }, client, cfg }
   let payload := pattern size
   let mut done := 0
   let mut current : Option Nat := none
@@ -245,13 +273,16 @@ def runTransfer (net : Net) (size streams : Nat) (seed : Nat) (retry : Bool) : I
     if done == streams then
       let srv := sim.server.map (fun s => (s.acksSent, s.elicitingRecv)) |>.getD (0, 0)
       let cli := (sim.client.acksSent, sim.client.elicitingRecv)
-      pure { ok := true, millis := t1 - t0, acks := (cli, srv),
-             detail := s!"{size * streams} bytes, {sim.sentDatagrams} datagrams ({sim.dropped} dropped), {sim.retries} Retry, {simulated} ms simulated, ACKs {cli.1}/{cli.2} client, {srv.1}/{srv.2} server" }
+      let updates := (sim.client.keyUpdates, (sim.server.map (·.keyUpdates)).getD 0)
+      pure { ok := cfg.keyUpdateInterval == 0 || (updates.1 > 0 && updates.2 > 0),
+             millis := t1 - t0, acks := (cli, srv),
+             detail := s!"{size * streams} bytes, {sim.sentDatagrams} datagrams ({sim.dropped} dropped), {sim.retries} Retry, {simulated} ms simulated, ACKs {cli.1}/{cli.2} client, {srv.1}/{srv.2} server, key updates {updates.1} client, {updates.2} server" }
     else pure { ok := false, millis := t1 - t0,
                 detail := s!"stalled after {done} streams, established {sim.client.isEstablished}, {simulated} ms simulated" }
 
 def main : IO UInt32 := do
   let mut failed ← ackChecks
+  failed := failed + (← keyChecks)
   let cases : List (String × Net × Nat × Nat) := [
     ("clean, 1 byte", ⟨0, 0, 0⟩, 1, 1),
     ("clean, empty stream", ⟨0, 0, 0⟩, 0, 1),
@@ -266,6 +297,13 @@ def main : IO UInt32 := do
       let retry := seed != 3
       let o ← runTransfer net size streams seed retry
       IO.println s!"  {if o.ok then "ok  " else "FAIL"}  {name} (seed {seed}{if retry then ", Retry" else ""}): {o.detail}, {o.millis} ms"
+      if !o.ok then failed := failed + 1
+  -- Key updates every 50 packets, by both sides, clean and lossy.
+  for (name, net, size) in [("clean, 1 MB", (⟨0, 0, 0⟩ : Net), 1000000),
+      ("5% loss, 10% reorder, 1 MB", ⟨5, 10, 1⟩, 1000000)] do
+    for seed in [1, 2] do
+      let o ← runTransfer net size 1 seed true { keyUpdateInterval := 50 }
+      IO.println s!"  {if o.ok then "ok  " else "FAIL"}  {name}, key update every 50 packets (seed {seed}): {o.detail}, {o.millis} ms"
       if !o.ok then failed := failed + 1
   IO.println (if failed == 0 then "all loopback transfers passed" else s!"{failed} loopback transfers failed")
   pure (if failed == 0 then 0 else 1)
