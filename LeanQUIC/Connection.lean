@@ -142,6 +142,8 @@ structure Config where
   maxData : Nat := 16 * 1024 * 1024
   maxStreamData : Nat := 4 * 1024 * 1024
   maxStreamsBidi : Nat := 100
+  /-- Unidirectional streams the peer may open at once. -/
+  maxStreamsUni : Nat := 100
   /-- How long we may delay an acknowledgment, in milliseconds (`max_ack_delay`). -/
   maxAckDelay : Nat := 25
   /-- Update the 1-RTT keys after this many packets under one key; 0 updates them only before
@@ -208,6 +210,11 @@ structure Conn where
   peerStreamsOpened : Nat := 0
   peerMaxStreams : Nat := 0
   localMaxStreams : Nat
+  /-- The same for unidirectional streams. -/
+  nextLocalUni : Nat
+  peerUniOpened : Nat := 0
+  peerMaxStreamsUni : Nat := 0
+  localMaxStreamsUni : Nat
   peerMaxData : Nat := 0
   dataSent : Nat := 0
   localMaxData : Nat
@@ -258,9 +265,9 @@ def localTransportParams (cfg : Config) (isClient : Bool) (localCid originalDcid
     initialMaxData := cfg.maxData,
     initialMaxStreamDataBidiLocal := cfg.maxStreamData,
     initialMaxStreamDataBidiRemote := cfg.maxStreamData,
-    initialMaxStreamDataUni := 0,
+    initialMaxStreamDataUni := cfg.maxStreamData,
     initialMaxStreamsBidi := cfg.maxStreamsBidi,
-    initialMaxStreamsUni := 0,
+    initialMaxStreamsUni := cfg.maxStreamsUni,
     maxAckDelay := cfg.maxAckDelay,
     activeConnectionIdLimit := cfg.activeCidLimit,
     statelessResetToken := if isClient then none else some (resetToken cfg.resetKey localCid),
@@ -311,7 +318,7 @@ def acceptPeerParams (c : Conn) (now : Nat) (raw : ByteArray) : Conn :=
     if !cidOk then c.fail now .transportParameter "connection ID mismatch"
     else
       { c with peerParams := some p, peerMaxData := p.initialMaxData,
-               peerMaxStreams := p.initialMaxStreamsBidi,
+               peerMaxStreams := p.initialMaxStreamsBidi, peerMaxStreamsUni := p.initialMaxStreamsUni,
                peerCids := [(0, c.remoteCid, p.statelessResetToken.getD ByteArray.empty)],
                recovery := c.recovery.setMaxAckDelay (p.maxAckDelay * 1000) }
 
@@ -338,19 +345,35 @@ def feedTls (c : Conn) (now : Nat) (level : Level) (data : ByteArray) : Conn :=
             c := c.discardSpace .handshake
     pure c
 
+/-- Whether a stream is unidirectional, and whether we opened it (RFC 9000 §2.1). -/
+def isUni (id : Nat) : Bool := id % 4 ≥ 2
+def isLocal (c : Conn) (id : Nat) : Bool := (id % 2 == 0) == c.isClient
+
 def streamLimitFor (c : Conn) (id : Nat) : Nat :=
   match c.peerParams with
   | none => 0
   | some p =>
-    let localInitiated := (id % 2 == 0) == c.isClient
-    if localInitiated then p.initialMaxStreamDataBidiRemote else p.initialMaxStreamDataBidiLocal
+    if isUni id then (if c.isLocal id then p.initialMaxStreamDataUni else 0)
+    else if c.isLocal id then p.initialMaxStreamDataBidiRemote else p.initialMaxStreamDataBidiLocal
 
 /-- The stream a peer's frame refers to, created if new; `none` for one already closed, whose
 late or duplicated frames are ignored. -/
 def peerStream (c : Conn) (id : Nat) : Except (TransportError × String) (Conn × Option Stream) := do
+  if isUni id then
+    if c.isLocal id then throw (.streamState, "data on a stream only we send on")
+    if let some s := c.streams[id]? then return (c, some s)
+    if id / 4 < c.peerUniOpened then return (c, none)
+    if id / 4 >= c.localMaxStreamsUni then throw (.streamLimit, "unidirectional stream limit")
+    let mut c := c
+    for n in [c.peerUniOpened:id / 4 + 1] do
+      let sid := 4 * n + 2 + (if c.isClient then 1 else 0)
+      let s : Stream := { recv := Buffers.Recv.init c.config.maxStreamData, sendLimit := 0,
+                          advertised := c.config.maxStreamData }
+      c := { c with streams := c.streams.insert sid s, incoming := c.incoming.push sid }
+    c := { c with peerUniOpened := id / 4 + 1 }
+    return (c, c.streams[id]?)
   if let some s := c.streams[id]? then return (c, some s)
-  if id % 4 >= 2 then throw (.streamState, "unidirectional stream")
-  let localInitiated := (id % 2 == 0) == c.isClient
+  let localInitiated := c.isLocal id
   if localInitiated then
     if id < c.nextLocalStream then return (c, none)
     throw (.streamState, "unopened local stream")
@@ -445,10 +468,12 @@ def onFrame (c : Conn) (now : Nat) (sp : Space) (f : Frame) : Except (TransportE
     c.onStreamFrame id off data fin
   | .maxData m => pure { c with peerMaxData := max c.peerMaxData m }
   | .maxStreamData id m =>
+    if isUni id && !c.isLocal id then throw (.streamState, "MAX_STREAM_DATA for a stream only the peer sends on")
     match c.streams[id]? with
     | some s => pure { c with streams := c.streams.insert id { s with sendLimit := max s.sendLimit m } }
     | none => pure c
   | .maxStreams true m => pure { c with peerMaxStreams := max c.peerMaxStreams m }
+  | .maxStreams false m => pure { c with peerMaxStreamsUni := max c.peerMaxStreamsUni m }
   | .pathChallenge d => pure { c with pendingControl := c.pendingControl.push (.pathResponse d) }
   | .pathResponse d =>
     match c.pathChallenge with
@@ -991,14 +1016,24 @@ def openStream (c : Conn) : Conn × Option Nat :=
                       advertised := c.config.maxStreamData }
   ({ c with streams := c.streams.insert id s, nextLocalStream := id + 4 }, some id)
 
+/-- Open a unidirectional stream to send on, if the peer allows another. -/
+def openUniStream (c : Conn) : Conn × Option Nat :=
+  let id := c.nextLocalUni
+  if !c.isEstablished || id / 4 ≥ c.peerMaxStreamsUni then (c, none) else
+  let s : Stream := { recv := Buffers.Recv.init 0, sendLimit := c.streamLimitFor id, advertised := 0 }
+  ({ c with streams := c.streams.insert id s, nextLocalUni := id + 4 }, some id)
+
+/-- Whether we may send on a stream: not on one only the peer sends on. -/
+def canSend (c : Conn) (id : Nat) : Bool := !isUni id || c.isLocal id
+
 def write (c : Conn) (id : Nat) (data : ByteArray) : Conn :=
   match c.streams[id]? with
-  | some s => { c with streams := c.streams.insert id { s with send := s.send.write data } }
+  | some s => if c.canSend id then { c with streams := c.streams.insert id { s with send := s.send.write data } } else c
   | none => c
 
 def finish (c : Conn) (id : Nat) : Conn :=
   match c.streams[id]? with
-  | some s => { c with streams := c.streams.insert id { s with send := s.send.finish } }
+  | some s => if c.canSend id then { c with streams := c.streams.insert id { s with send := s.send.finish } } else c
   | none => c
 
 /-- Read up to `max` bytes; raises the peer's credit as data is consumed. -/
@@ -1032,13 +1067,17 @@ def sendFinished (c : Conn) (id : Nat) : Bool := (c.streams[id]?.map (·.send.is
 
 /-- Forget a stream both sides are done with; a peer stream frees a slot for another. -/
 def retire (c : Conn) (id : Nat) : Conn :=
-  if !(c.recvFinished id && c.sendFinished id) then c else
+  let done := if isUni id then (if c.isLocal id then c.sendFinished id else c.recvFinished id)
+    else c.recvFinished id && c.sendFinished id
+  if !done then c else
   let c := { c with streams := c.streams.erase id }
-  let peerInitiated := (id % 2 == 0) != c.isClient
-  if peerInitiated then
+  if c.isLocal id then c
+  else if isUni id then
+    let m := c.localMaxStreamsUni + 1
+    { c with localMaxStreamsUni := m, pendingControl := c.pendingControl.push (.maxStreams false m) }
+  else
     let m := c.localMaxStreams + 1
     { c with localMaxStreams := m, pendingControl := c.pendingControl.push (.maxStreams true m) }
-  else c
 
 def takeIncoming (c : Conn) : Conn × Array Nat := ({ c with incoming := #[] }, c.incoming)
 
@@ -1064,6 +1103,7 @@ def newClient (cfg : Config) (tlsCfg : LeanTLS.Handshake.Client.Config) (seed : 
     { isClient := true, config := cfg, tls := .client tlsCfg st, localCid, remoteCid := dcid,
       originalDcid := dcid, recovery := Recovery.init true maxDatagram, localParams := params,
       nextLocalStream := 0, localMaxStreams := cfg.maxStreamsBidi, localMaxData := cfg.maxData,
+      nextLocalUni := 2, localMaxStreamsUni := cfg.maxStreamsUni,
       addressValidated := true, idleDeadline := some (now + cfg.idleTimeout * 1000),
       localCids := [(0, localCid)], cidSecret := deriveSecret seed "quic cid" }
   c := c.setSpace .initial { c.initial with sealer := c.initial.sealer.rekey ck, readKeys := some sk }
@@ -1086,6 +1126,7 @@ def newServer (cfg : Config) (tlsCfg : LeanTLS.Handshake.Server.Config) (seed : 
       localCid, remoteCid := peerCid, remoteCidSet := true, originalDcid := retrySource.getD odcid,
       retrySource, recovery := (Recovery.init false maxDatagram).setPeerCompletedAddressValidation,
       localParams := params, nextLocalStream := 1, localMaxStreams := cfg.maxStreamsBidi,
+      nextLocalUni := 3, localMaxStreamsUni := cfg.maxStreamsUni,
       localMaxData := cfg.maxData, addressValidated := retrySource.isSome,
       idleDeadline := some (now + cfg.idleTimeout * 1000),
       localCids := [(0, localCid)], cidSecret := deriveSecret seed "quic cid" }

@@ -209,12 +209,13 @@ partial def runServer (cfg : Endpoint.Config) (listen : SocketAddress)
     loop ps
   (loop {}).block
 
-/-- The server application of the interop tests: every stream echoed back, finished when the
-client finishes. -/
+/-- The server application of the interop tests: every bidirectional stream echoed back, finished
+when the client finishes. -/
 def echo (c : Conn) : Conn := Id.run do
   let (c, _) := c.takeIncoming
   let mut c := c
   for (id, _) in c.streams.toList do
+    if Conn.isUni id then continue
     let (c', data) := c.read id (c.readable id)
     c := c'.write id data
     if c.recvFinished id then c := c.finish id

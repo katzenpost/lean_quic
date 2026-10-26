@@ -164,13 +164,14 @@ server read ping on stream 0
 | | |
 |---|---|
 | `c.openStream : Conn × Option Nat` | a new bidirectional stream, if the peer's limit allows |
+| `c.openUniStream : Conn × Option Nat` | a new stream only we send on, if the peer's limit allows |
 | `c.write id data`, `c.finish id` | queue data; mark its end |
 | `c.readable id`, `c.read id n : Conn × ByteArray` | bytes ready in order; take up to `n` |
 | `c.recvComplete id` | the peer finished and every byte has arrived |
 | `c.recvFinished id` | … and every byte has been read |
 | `c.sendFinished id` | everything written, and the end, acknowledged |
 | `c.takeIncoming : Conn × Array Nat` | streams the peer opened since the last call |
-| `c.retire id` | drop a stream both sides are done with, freeing a slot for the peer |
+| `c.retire id` | drop a stream both sides are done with (the sender's side alone for a unidirectional one), freeing a slot for the peer |
 | `c.close now` | close the connection with no error |
 
 ## Tests

@@ -93,6 +93,7 @@ def echo (c : Conn) : Conn := Id.run do
   let (c', _) := c.takeIncoming
   c := c'
   for (id, _) in c.streams.toList do
+    if Conn.isUni id then continue
     let (c', data) := c.read id (c.readable id)
     c := c'.write id data
     if c.recvFinished id then c := c.finish id
@@ -272,6 +273,33 @@ def pathChecks : IO Nat := do
   if !back then failed := failed + 1
   pure failed
 
+/-- Unidirectional streams (RFC 9000 §2): data each way, the peer's stream limit, and a slot freed
+by a finished stream. -/
+def uniChecks : IO Nat := do
+  let sim ← connected { maxStreamsUni := 2 }
+  let mut failed := 0
+  let data := pattern 50000
+  let (c, a) := sim.client.openUniStream
+  let (c, b) := c.openUniStream
+  let (c, third) := c.openUniStream
+  let some a := a | throw (IO.userError "no stream")
+  let limited := b.isSome && third.isNone
+  IO.println s!"  {if limited then "ok  " else "FAIL"}  the server's limit of 2 unidirectional streams holds"
+  if !limited then failed := failed + 1
+  let sim ← settle { sim with client := (c.write a data).finish a }
+  let some srv := sim.server | throw (IO.userError "no server")
+  let (srv, got) := srv.read a (srv.readable a)
+  let srvNoSend := (srv.write a data).streams[a]?.all (·.send.sentOffset == 0)
+  let (srv, back) := srv.retire a |>.openUniStream
+  let some back := back | throw (IO.userError "no stream back")
+  let sim ← settle { sim with server := some ((srv.write back data).finish back) }
+  let (cl, got2) := sim.client.read back (sim.client.readable back)
+  let (_, again) := cl.openUniStream
+  let ok := got == data && srvNoSend && got2 == data && cl.recvFinished back && again.isSome
+  IO.println s!"  {if ok then "ok  " else "FAIL"}  {got.size} bytes to the server and {got2.size} back on unidirectional streams; a finished one frees a slot"
+  if !ok then failed := failed + 1
+  pure failed
+
 def decision : Endpoint.Decision → String
   | .drop => "drop"
   | .retry _ => "retry"
@@ -410,6 +438,7 @@ def main : IO UInt32 := do
   failed := failed + (← keyChecks)
   failed := failed + (← cidChecks)
   failed := failed + (← pathChecks)
+  failed := failed + (← uniChecks)
   let cases : List (String × Net × Nat × Nat) := [
     ("clean, 1 byte", ⟨0, 0, 0⟩, 1, 1),
     ("clean, empty stream", ⟨0, 0, 0⟩, 0, 1),
