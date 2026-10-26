@@ -38,7 +38,7 @@ def main (args : List String) : IO UInt32 := do
     for _ in [0:2] do
       if p.done == streams then
         let suite := (c.app.writeKeys.map (·.suite.cipherSuite.name)).getD "?"
-        return (c, some s!"OK bytes={size * streams} group=X25519MLKEM768 suite={suite}")
+        return (c, some s!"OK bytes={size * streams} group=X25519MLKEM768 suite={suite} keyupdates={c.keyUpdates}")
       match p.current with
       | none =>
         let (c', id) := c.openStream
@@ -58,7 +58,8 @@ def main (args : List String) : IO UInt32 := do
           p := { p with done := p.done + 1, current := none }
     st.set p
     pure (c, none)
-  match ← runClient {} tls server app with
+  let keyUpdate := ((argOf args "--key-update").bind String.toNat?).getD 0
+  match ← runClient { keyUpdateInterval := keyUpdate } tls server app with
   | .ok line =>
     IO.println line
     pure 0

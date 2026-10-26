@@ -12,6 +12,8 @@ DROP=${DROP:-5}
 REORDER=${REORDER:-5}
 LEAN_SERVER=${LEAN_SERVER:-}
 LEAN_CLIENT=${LEAN_CLIENT:-}
+# Packets between key updates the Lean endpoints start themselves; empty for none.
+KEY_UPDATE=${KEY_UPDATE:-}
 
 export QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING=true
 
@@ -32,6 +34,13 @@ free_port() {
 		p=$((20000 + RANDOM % 40000))
 		[ -z "$(ss -Hlun "sport = :$p" 2>/dev/null)" ] && { echo "$p"; return; }
 	done
+}
+
+# Extra arguments for an endpoint.
+args_for() {
+	case $1 in
+	lean-*) [ -n "$KEY_UPDATE" ] && echo "--key-update $KEY_UPDATE" ;;
+	esac
 }
 
 cmd_for() {
@@ -80,7 +89,7 @@ run() {
 	sport=$(free_port)
 	port=$sport
 	start=$(date +%s.%N)
-	spawn "$log.server" "$(cmd_for "$server")" --listen "127.0.0.1:$sport" --seed "$SEED"
+	spawn "$log.server" "$(cmd_for "$server")" --listen "127.0.0.1:$sport" --seed "$SEED" $(args_for "$server")
 	spid=$spawned
 	if ! await_ready "$log.server" "$spid"; then
 		result=FAIL detail="server not ready"
@@ -97,7 +106,7 @@ run() {
 		local ccmd
 		ccmd=$(cmd_for "$client")
 		timeout "$TIMEOUT" bash -c "exec $ccmd \"\$@\"" "$ccmd" --connect "127.0.0.1:$port" --pin "$pin" \
-			--payload-size "$size" --streams "$streams" >"$log.client.out" 2>"$log.client.err"
+			--payload-size "$size" --streams "$streams" $(args_for "$client") >"$log.client.out" 2>"$log.client.err"
 		local rc=$?
 		local want="OK bytes=$((size * streams)) group=X25519MLKEM768 suite="
 		if [ $rc -eq 124 ]; then

@@ -40,3 +40,13 @@ jobs:
           LEAN_CLIENT: ${{ github.workspace }}/.lake/build/bin/quic_echo_client
           TIMEOUT: "180"
         run: ./run.sh
+      - name: Interoperate with Lean endpoints updating their keys every 50 packets
+        working-directory: interop
+        env:
+          LEAN_ABORT_ON_PANIC: "1"
+          LEAN_SERVER: ${{ github.workspace }}/.lake/build/bin/quic_echo_server
+          LEAN_CLIENT: ${{ github.workspace }}/.lake/build/bin/quic_echo_client
+          TIMEOUT: "180"
+          KEY_UPDATE: "50"
+          SIZES: "3000000"
+        run: ./run.sh

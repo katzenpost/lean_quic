@@ -137,6 +137,9 @@ structure Config where
   maxStreamsBidi : Nat := 100
   /-- How long we may delay an acknowledgment, in milliseconds (`max_ack_delay`). -/
   maxAckDelay : Nat := 25
+  /-- Update the 1-RTT keys after this many packets under one key; 0 updates them only before
+  the AEAD's confidentiality limit. -/
+  keyUpdateInterval : Nat := 0
 
 structure Conn where
   isClient : Bool
@@ -153,6 +156,16 @@ structure Conn where
   handshake : SpaceState := {}
   app : SpaceState := {}
   keyPhase : Bool := false
+  /-- The 1-RTT read keys of the previous key phase, for delayed packets, and when they go. -/
+  prevReadKeys : Option (Keys × Nat) := none
+  /-- The first packet number sent under the current 1-RTT write keys. -/
+  phaseStartPn : Nat := 0
+  /-- The peer updated its keys and we have not yet acknowledged one of its new packets. -/
+  peerUpdateUnacked : Bool := false
+  /-- 1-RTT packets that failed authentication (RFC 9001 §6.6). -/
+  authFailures : Nat := 0
+  /-- Key updates, ours and the peer's. -/
+  keyUpdates : Nat := 0
   recovery : Recovery.State
   localParams : TransportParams
   peerParams : Option TransportParams := none
@@ -445,6 +458,29 @@ def onPacket (c : Conn) (now : Nat) (sp : Space) (pn : Nat) (payload : ByteArray
     pure { c with idleDeadline := some (now + c.idleTimeoutUs),
                   elicitingRecv := c.elicitingRecv + (if eliciting then 1 else 0) }
 
+/-- Failed decryptions the suite tolerates across a connection (RFC 9001 §6.6). -/
+def integrityLimit : Suite → Nat
+  | .aes128gcm => 2 ^ 52
+  | .chacha20poly1305 => 2 ^ 36
+
+/-- Move to the next generation of 1-RTT keys, keeping the old read keys for 3 PTOs. -/
+def rotateKeys (c : Conn) (now : Nat) : Option Conn := do
+  let rk ← c.app.readKeys
+  let wk ← c.app.writeKeys
+  let c := c.modifySpace .application fun s =>
+    { s with readKeys := some rk.next, sealer := s.sealer.rekey wk.next }
+  pure { c with keyPhase := !c.keyPhase,
+                prevReadKeys := some (rk, now + 3 * c.recovery.ptoDuration .application),
+                phaseStartPn := c.app.nextPn, keyUpdates := c.keyUpdates + 1 }
+
+/-- A 1-RTT packet failed authentication; past the integrity limit the connection closes. -/
+def authFailed (c : Conn) (now : Nat) : Conn :=
+  let c := { c with authFailures := c.authFailures + 1 }
+  match c.app.readKeys with
+  | some k => if c.authFailures ≥ integrityLimit k.suite then
+      c.fail now .aeadLimitReached "integrity limit" else c
+  | none => c
+
 /-- The client's response to a Retry (RFC 9000 §17.2.5.2): new Initial keys and the token, and the
 ClientHello again. -/
 def onRetry (c : Conn) (now : Nat) (scid token pkt : ByteArray) : Conn :=
@@ -497,25 +533,65 @@ def recv (c : Conn) (now : Nat) (dgram : ByteArray) : Conn := Id.run do
       -- A server processes no 1-RTT packet before its handshake completes (RFC 9001 §5.7).
       if !c.isClient && c.tls.established?.isNone then continue
       let some keys := c.app.readKeys | continue
-      match openPacket keys false pkt pnOffset c.app.largestRecv with
-      | some o =>
-        if o.firstByte &&& 0x18 != 0 then
-          c := c.fail now .protocolViolation "reserved bits"
+      if let some (_, d) := c.prevReadKeys then
+        if now ≥ d then c := { c with prevReadKeys := none }
+      -- The current keys, then the previous phase's for a delayed packet, then the next phase's
+      -- for a key update by the peer (RFC 9001 §6.2, §6.5).
+      let current := (openPacket keys false pkt pnOffset c.app.largestRecv).filter
+        fun o => o.phaseBit == c.keyPhase
+      let previous := c.prevReadKeys.bind fun (pk, _) =>
+        (openPacket pk false pkt pnOffset c.app.largestRecv).filter fun o => o.phaseBit != c.keyPhase
+      let updated := if current.isSome || previous.isSome then none else
+        (openPacket keys.next false pkt pnOffset c.app.largestRecv).filter
+          fun o => o.phaseBit != c.keyPhase
+      let some o := current <|> previous <|> updated
+        | c := c.authFailed now
           continue
-        if (o.firstByte &&& 0x04 != 0) != c.keyPhase then continue
-        c := c.onPacket now .application o.pn o.payload
-      | none =>
-        -- The peer may have updated its keys (RFC 9001 §6.2).
-        if let some wk := c.app.writeKeys then
-          let nk := keys.next
-          if let some o := openPacket nk false pkt pnOffset c.app.largestRecv then
-            if (o.firstByte &&& 0x04 != 0) != c.keyPhase then
-              c := c.modifySpace .application fun s => { s with readKeys := some nk, sealer := s.sealer.rekey wk.next }
-              c := { c with keyPhase := !c.keyPhase }
-              c := c.onPacket now .application o.pn o.payload
+      if o.firstByte &&& 0x18 != 0 then
+        c := c.fail now .protocolViolation "reserved bits"
+        continue
+      if updated.isSome then
+        if c.peerUpdateUnacked then
+          c := c.fail now .keyUpdate "a second key update before we acknowledged the first"
+          continue
+        c := (c.rotateKeys now).getD c
+        c := { c with peerUpdateUnacked := true }
+      c := c.onPacket now .application o.pn o.payload
   pure c
 
 /-! ## Sending -/
+
+/-- Packets the suite allows under one key (RFC 9001 §6.6); ChaCha20-Poly1305's limit is beyond
+any packet number. -/
+def confidentialityLimit : Suite → Option Nat
+  | .aes128gcm => some (2 ^ 23)
+  | .chacha20poly1305 => none
+
+/-- Whether this endpoint may update its keys now (RFC 9001 §6.1, §6.5): the handshake is
+confirmed and the peer acknowledged a packet sent under the current keys. -/
+def canUpdateKeys (c : Conn) : Bool :=
+  c.handshakeConfirmed && c.app.writeKeys.isSome &&
+    (c.app.largestAcked.any (· ≥ c.phaseStartPn))
+
+/-- Update the 1-RTT keys (RFC 9001 §6), as the application asks or the AEAD limits require. Has no
+effect while an update is not allowed. -/
+def updateKeys (c : Conn) (now : Nat) : Conn :=
+  if c.canUpdateKeys then (c.rotateKeys now).getD c else c
+
+/-- Before sending 1-RTT packets: update the keys at the configured interval or before the
+confidentiality limit, and close if the limit is reached all the same. -/
+def checkKeyLimits (c : Conn) (now : Nat) : Conn :=
+  match c.app.writeKeys with
+  | none => c
+  | some wk =>
+    let used := c.app.nextPn - c.phaseStartPn
+    let limit := confidentialityLimit wk.suite
+    let due := (c.config.keyUpdateInterval > 0 && used ≥ c.config.keyUpdateInterval) ||
+      limit.any (used + 1000 ≥ ·)
+    let c := if due then c.updateKeys now else c
+    if limit.any (c.app.nextPn - c.phaseStartPn ≥ ·) then
+      c.fail now .aeadLimitReached "confidentiality limit"
+    else c
 
 /-- Bytes the server may still send before the client's address is validated (RFC 9000 §8.1). -/
 def amplificationAllowance (c : Conn) : Nat :=
@@ -529,7 +605,8 @@ def ackFrame (s : SpaceState) (now : Nat) (sp : Space) : Option Frame :=
 /-- An acknowledgment went out: nothing is pending until the next ack-eliciting packet. -/
 def ackSent (c : Conn) (sp : Space) : Conn :=
   { c.modifySpace sp (fun s => { s with ackPending := false, unackedEliciting := 0, ackDeadline := none })
-    with acksSent := c.acksSent + 1 }
+    with acksSent := c.acksSent + 1,
+         peerUpdateUnacked := c.peerUpdateUnacked && sp != .application }
 
 structure Built where
   frames : Array Frame := #[]
@@ -648,6 +725,7 @@ def headerOverhead (c : Conn) (sp : Space) : Nat :=
 
 /-- The next datagram to send, if any. -/
 def poll (c : Conn) (now : Nat) : Conn × Option ByteArray := Id.run do
+  let c := if c.isEstablished then c.checkKeyLimits now else c
   match c.phase with
   | .closed | .draining _ => return (c, none)
   | .closing d f sent =>
