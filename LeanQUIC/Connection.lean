@@ -738,6 +738,12 @@ def readable (c : Conn) (id : Nat) : Nat := (c.streams[id]?.map (·.recv.readabl
 /-- The peer finished the stream and everything it sent has been read. -/
 def recvFinished (c : Conn) (id : Nat) : Bool := (c.streams[id]?.map (·.recv.isFinished)).getD false
 
+/-- The peer finished the stream and all of it has arrived, read or not. -/
+def recvComplete (c : Conn) (id : Nat) : Bool :=
+  match c.streams[id]? with
+  | some s => s.recv.finalSize == some (s.recv.readOffset + s.recv.readable)
+  | none => false
+
 def sendFinished (c : Conn) (id : Nat) : Bool := (c.streams[id]?.map (·.send.isAllAcked)).getD false
 
 /-- Forget a stream both sides are done with; a peer stream frees a slot for another. -/

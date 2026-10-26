@@ -13,7 +13,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: leanprover/lean-action@v1
         with:
-          build-args: "LeanQUIC LeanQUIC.Tests.Vectors LeanQUIC.Tests.Recovery LeanQUIC.Tests.Buffers LeanQUIC.Tests.Loopback quic_echo_server quic_echo_client"
+          build-args: "LeanQUIC LeanQUIC.Tests.Vectors LeanQUIC.Tests.Recovery LeanQUIC.Tests.Buffers LeanQUIC.Tests.Loopback quic_echo_server quic_echo_client example_server example_client example_sansio"
       - name: Run tests
         env:
           # panics in compiled Lean print a message but exit 0 unless this is set
@@ -23,6 +23,7 @@ jobs:
           ./.lake/build/bin/LeanQUIC-Tests-Recovery
           ./.lake/build/bin/LeanQUIC-Tests-Buffers
           ./.lake/build/bin/LeanQUIC-Tests-Loopback
+          ./.lake/build/bin/example_sansio
       - name: Check the test vectors match their recorded hashes
         run: sha256sum -c testdata/rfc9001_appendix_a.json.sha256
       - uses: actions/setup-go@v5

@@ -37,3 +37,15 @@ root = "LeanQUIC.Cmd.EchoServer"
 [[lean_exe]]
 name = "quic_echo_client"
 root = "LeanQUIC.Cmd.EchoClient"
+
+[[lean_exe]]
+name = "example_server"
+root = "LeanQUIC.Examples.Server"
+
+[[lean_exe]]
+name = "example_client"
+root = "LeanQUIC.Examples.Client"
+
+[[lean_exe]]
+name = "example_sansio"
+root = "LeanQUIC.Examples.SansIO"
