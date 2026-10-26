@@ -248,6 +248,7 @@ def cidChecks : IO Nat := do
 def decision : Endpoint.Decision → String
   | .drop => "drop"
   | .retry _ => "retry"
+  | .reset _ => "reset"
   | .accept _ _ => "accept"
 
 /-- Retry tokens: a client's second Initial is accepted while its token is fresh, and dropped once
