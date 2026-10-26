@@ -109,17 +109,13 @@ def deliver (retry : Bool) (sim : Sim) (toServer : Bool) (d : ByteArray) : Sim :
       match Endpoint.onUnknown (endpoint retry sim.cfg) "127.0.0.1:1".toUTF8 d sim.now ⟨#[7, 7, 7, 7, 7, 7, 7, 7]⟩ seed with
       | .drop => { sim with dropped := sim.dropped + 1 }
       | .retry pkt => { sim with wire := sim.wire.push (sim.now + 10000, false, pkt), retries := sim.retries + 1 }
+      | .reset pkt => { sim with wire := sim.wire.push (sim.now + 10000, false, pkt) }
       | .accept s _ => { sim with server := some (echo (s.recv sim.now d)) }
   else { sim with client := sim.client.recv sim.now d }
 
-/-- A client and server connected over a clean network, and nothing left in flight. -/
-def connected : IO Sim := do
-  let cseed : Vector UInt8 32 := Vector.ofFn fun i => UInt8.ofNat (i.val + 40)
-  let client ← match Conn.newClient {} clientTls cseed ⟨#[1, 2, 3, 4, 5, 6, 7, 8]⟩
-      ⟨#[9, 8, 7, 6, 5, 4, 3, 2]⟩ 1000000 with
-    | .ok c => pure c
-    | .error a => throw (IO.userError s!"client: {repr a}")
-  let mut sim : Sim := { now := 1000000, rng := { s := 1 }, client }
+/-- Run a clean network until nothing is in flight and both sides are established. -/
+def settle (sim : Sim) : IO Sim := do
+  let mut sim := sim
   for _ in [0:100] do
     sim := flush ⟨0, 0, 0⟩ sim
     if sim.wire.isEmpty && sim.client.isEstablished && (sim.server.any (·.isEstablished)) then break
@@ -129,6 +125,15 @@ def connected : IO Sim := do
     for (_, toServer, d) in due do
       sim := deliver false sim toServer d
   pure sim
+
+/-- A client and server connected over a clean network, and nothing left in flight. -/
+def connected (cfg : LeanQUIC.Config := {}) : IO Sim := do
+  let cseed : Vector UInt8 32 := Vector.ofFn fun i => UInt8.ofNat (i.val + 40)
+  let client ← match Conn.newClient cfg clientTls cseed ⟨#[1, 2, 3, 4, 5, 6, 7, 8]⟩
+      ⟨#[9, 8, 7, 6, 5, 4, 3, 2]⟩ 1000000 with
+    | .ok c => pure c
+    | .error a => throw (IO.userError s!"client: {repr a}")
+  settle { now := 1000000, rng := { s := 1 }, client, cfg }
 
 /-- Every datagram a connection has to send now. -/
 def drain (c : Conn) (now : Nat) : Conn × Array ByteArray := Id.run do
@@ -197,6 +202,47 @@ def keyChecks : IO Nat := do
   let counted := s.authFailures == srv.authFailures + 1 && !s.isClosed
   IO.println s!"  {if counted then "ok  " else "FAIL"}  a tampered 1-RTT packet counts as an authentication failure"
   if !counted then failed := failed + 1
+  pure failed
+
+/-- Connection IDs (RFC 9000 §5.1, §10.3): each side offers the other four, a client can move to a
+fresh one of the server's, and a server that lost the connection resets the client statelessly. -/
+def cidChecks : IO Nat := do
+  let cfg : LeanQUIC.Config := { resetKey := ⟨Array.replicate 32 9⟩ }
+  let sim ← connected cfg
+  let some srv := sim.server | throw (IO.userError "no server")
+  let mut failed := 0
+  let offered := sim.client.peerCids.length == 4 && srv.peerCids.length == 4 &&
+    srv.activeLocalCids.length == 4 && sim.client.activeLocalCids.length == 4
+  IO.println s!"  {if offered then "ok  " else "FAIL"}  connection IDs offered: client knows {sim.client.peerCids.length} of the server's, server {srv.peerCids.length} of the client's"
+  if !offered then failed := failed + 1
+  -- The client moves to another of the server's connection IDs and sends on it.
+  let old := sim.client.remoteCid
+  let (c, id) := sim.client.rotateRemoteCid.openStream
+  let some id := id | throw (IO.userError "no stream")
+  let sim ← settle { sim with client := (c.write id (pattern 3000)).finish id }
+  let some srv := sim.server | throw (IO.userError "no server")
+  let (cr, data) := sim.client.read id (sim.client.readable id)
+  let echoed := data == pattern 3000 && cr.recvFinished id
+  let moved := sim.client.remoteCid != old && !srv.isLocalCid old && srv.activeLocalCids.length == 4 &&
+    srv.nextLocalSeq == 5 && echoed
+  IO.println s!"  {if moved then "ok  " else "FAIL"}  the client moves to a new connection ID: old retired by the server, replaced, {data.size} bytes echoed"
+  if !moved then failed := failed + 1
+  -- The server forgets the connection; the client's next packet draws a stateless reset.
+  let (c, id) := sim.client.openStream
+  let some id := id | throw (IO.userError "no stream")
+  let (c, ds) := drain ((c.write id (pattern 500)).finish id) sim.now
+  let some d := ds[0]? | throw (IO.userError "no datagram")
+  let reset := match Endpoint.onUnknown (endpoint true cfg) "127.0.0.1:1".toUTF8 d sim.now
+      ⟨#[7, 7, 7, 7, 7, 7, 7, 7]⟩ (Vector.replicate 32 3) with
+    | .reset pkt => some pkt
+    | _ => none
+  let ok := match reset with
+    | some pkt =>
+      let c := c.recv (sim.now + 10000) pkt
+      pkt.size < d.size && c.closeReason.any (·.2.2 == "stateless reset") && (c.poll (sim.now + 10000)).2.isNone
+    | none => false
+  IO.println s!"  {if ok then "ok  " else "FAIL"}  a server without the connection resets it statelessly, and the client drains"
+  if !ok then failed := failed + 1
   pure failed
 
 structure Outcome where
@@ -283,6 +329,7 @@ def runTransfer (net : Net) (size streams : Nat) (seed : Nat) (retry : Bool)
 def main : IO UInt32 := do
   let mut failed ← ackChecks
   failed := failed + (← keyChecks)
+  failed := failed + (← cidChecks)
   let cases : List (String × Net × Nat × Nat) := [
     ("clean, 1 byte", ⟨0, 0, 0⟩, 1, 1),
     ("clean, empty stream", ⟨0, 0, 0⟩, 0, 1),

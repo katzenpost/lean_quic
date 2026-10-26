@@ -12,6 +12,7 @@ import LeanQUIC.Buffers
 import LeanQUIC.Error
 import LeanTLS.Handshake.Client
 import LeanTLS.Handshake.Server
+import Cryptlib.Primitives.MAC.HMAC
 
 namespace LeanQUIC
 
@@ -42,6 +43,12 @@ def Recovery.Space.level : Space → Level
 
 def maxDatagram : Nat := 1200
 def cidLength : Nat := 8
+
+/-- The stateless reset token for one of our connection IDs (RFC 9000 §10.3.2): a MAC of the
+connection ID under the endpoint's reset key, so the endpoint can recompute it after losing the
+connection. -/
+def resetToken (key cid : ByteArray) : ByteArray :=
+  (Cryptlib.Util.Bytes.ofVector (Cryptlib.Primitives.MAC.HMAC.hmacSha256 key cid)).extract 0 16
 /-- The CRYPTO reassembly cap per level. -/
 def cryptoCap : Nat := 65536
 
@@ -140,6 +147,10 @@ structure Config where
   /-- Update the 1-RTT keys after this many packets under one key; 0 updates them only before
   the AEAD's confidentiality limit. -/
   keyUpdateInterval : Nat := 0
+  /-- The key stateless reset tokens are made under; a server's endpoint shares it. -/
+  resetKey : ByteArray := ByteArray.empty
+  /-- Connection IDs we accept from the peer, and offer it at most (`active_connection_id_limit`). -/
+  activeCidLimit : Nat := 4
 
 structure Conn where
   isClient : Bool
@@ -152,6 +163,16 @@ structure Conn where
   retrySource : Option ByteArray := none
   token : ByteArray := ByteArray.empty
   remoteCidSet : Bool := false
+  /-- Our connection IDs in use, with their sequence numbers; `localCid` is sequence 0. -/
+  localCids : List (Nat × ByteArray) := []
+  nextLocalSeq : Nat := 1
+  /-- The secret our further connection IDs are derived from. -/
+  cidSecret : ByteArray := ByteArray.empty
+  /-- The peer's connection IDs: sequence number, ID, stateless reset token. -/
+  peerCids : List (Nat × ByteArray × ByteArray) := []
+  /-- The sequence number of `remoteCid`, and the lowest the peer still allows. -/
+  remoteCidSeq : Nat := 0
+  peerRetirePriorTo : Nat := 0
   initial : SpaceState := {}
   handshake : SpaceState := {}
   app : SpaceState := {}
@@ -231,7 +252,8 @@ def localTransportParams (cfg : Config) (isClient : Bool) (localCid originalDcid
     initialMaxStreamsBidi := cfg.maxStreamsBidi,
     initialMaxStreamsUni := 0,
     maxAckDelay := cfg.maxAckDelay,
-    activeConnectionIdLimit := 2,
+    activeConnectionIdLimit := cfg.activeCidLimit,
+    statelessResetToken := if isClient then none else some (resetToken cfg.resetKey localCid),
     initialSourceConnectionId := some localCid,
     originalDestinationConnectionId := if isClient then none else some originalDcid,
     retrySourceConnectionId := if isClient then none else retrySource }
@@ -280,6 +302,7 @@ def acceptPeerParams (c : Conn) (now : Nat) (raw : ByteArray) : Conn :=
     else
       { c with peerParams := some p, peerMaxData := p.initialMaxData,
                peerMaxStreams := p.initialMaxStreamsBidi,
+               peerCids := [(0, c.remoteCid, p.statelessResetToken.getD ByteArray.empty)],
                recovery := c.recovery.setMaxAckDelay (p.maxAckDelay * 1000) }
 
 /-- Feed CRYPTO bytes that became contiguous at a level to TLS, and act on its outputs. -/
@@ -417,6 +440,28 @@ def onFrame (c : Conn) (now : Nat) (sp : Space) (f : Frame) : Except (TransportE
     | none => pure c
   | .maxStreams true m => pure { c with peerMaxStreams := max c.peerMaxStreams m }
   | .pathChallenge d => pure { c with pendingControl := c.pendingControl.push (.pathResponse d) }
+  | .newConnectionId seq retirePriorTo cid token =>
+    if cid.size == 0 || cid.size > 20 || retirePriorTo > seq then
+      throw (.frameEncoding, "bad NEW_CONNECTION_ID")
+    let mut c := c
+    -- RFC 9000 §19.15: one sent before the peer's retire_prior_to is retired at once.
+    if seq < c.peerRetirePriorTo then
+      c := { c with pendingControl := c.pendingControl.push (.retireConnectionId seq) }
+    else if !(c.peerCids.any (·.1 == seq)) then
+      c := { c with peerCids := c.peerCids ++ [(seq, cid, token)] }
+    if retirePriorTo > c.peerRetirePriorTo then
+      let (gone, kept) := c.peerCids.partition (·.1 < retirePriorTo)
+      c := { c with peerRetirePriorTo := retirePriorTo, peerCids := kept,
+                    pendingControl := gone.foldl (fun a (s, _) => a.push (.retireConnectionId s)) c.pendingControl }
+      if c.remoteCidSeq < retirePriorTo then
+        let some (s, id, _) := kept.head? | throw (.protocolViolation, "no connection ID left")
+        c := { c with remoteCid := id, remoteCidSeq := s }
+    if c.peerCids.length > c.config.activeCidLimit then
+      throw (.connectionIdLimit, "too many connection IDs")
+    pure c
+  | .retireConnectionId seq =>
+    if seq ≥ c.nextLocalSeq then throw (.protocolViolation, "retiring a connection ID never issued")
+    pure { c with localCids := c.localCids.filter (·.1 != seq) }
   | .connectionClose app code _ reason =>
     let deadline := now + 3 * c.recovery.ptoDuration .application
     pure { c with phase := .draining deadline,
@@ -472,6 +517,54 @@ def rotateKeys (c : Conn) (now : Nat) : Option Conn := do
   pure { c with keyPhase := !c.keyPhase,
                 prevReadKeys := some (rk, now + 3 * c.recovery.ptoDuration .application),
                 phaseStartPn := c.app.nextPn, keyUpdates := c.keyUpdates + 1 }
+
+/-! ## Connection IDs (RFC 9000 §5.1) -/
+
+/-- Our connection IDs in use. -/
+def activeLocalCids (c : Conn) : List ByteArray := c.localCids.map (·.2)
+
+def isLocalCid (c : Conn) (cid : ByteArray) : Bool := c.localCids.any (·.2 == cid)
+
+/-- Our connection ID with sequence number `seq`. -/
+def newCid (c : Conn) (seq : Nat) : ByteArray :=
+  (Cryptlib.Util.Bytes.ofVector (Cryptlib.Primitives.MAC.HMAC.hmacSha256 c.cidSecret
+    ⟨(Array.range 8).map fun j => (seq >>> (8 * j)).toUInt8⟩)).extract 0 cidLength
+
+/-- Once established, offer the peer as many connection IDs as it takes. -/
+def issueCids (c : Conn) : Conn := Id.run do
+  if !c.isEstablished then return c
+  let some p := c.peerParams | return c
+  let want := min p.activeConnectionIdLimit c.config.activeCidLimit
+  let mut c := c
+  for _ in [0:8] do
+    if c.localCids.length ≥ want then break
+    let seq := c.nextLocalSeq
+    let cid := c.newCid seq
+    c := { c with localCids := c.localCids ++ [(seq, cid)], nextLocalSeq := seq + 1,
+                  pendingControl := c.pendingControl.push
+                    (.newConnectionId seq 0 cid (resetToken c.config.resetKey cid)) }
+  c
+
+/-- Move to a connection ID of the peer's not used yet, retiring the current one. Unchanged when
+the peer has offered no other. -/
+def rotateRemoteCid (c : Conn) : Conn :=
+  match c.peerCids.find? (·.1 > c.remoteCidSeq) with
+  | none => c
+  | some (seq, cid, _) =>
+    { c with remoteCid := cid, remoteCidSeq := seq,
+             peerCids := c.peerCids.filter (·.1 != c.remoteCidSeq),
+             pendingControl := c.pendingControl.push (.retireConnectionId c.remoteCidSeq) }
+
+/-- Whether a datagram is a stateless reset from the peer (RFC 9000 §10.3.1): it ends with the
+reset token of one of the peer's connection IDs. -/
+def isStatelessReset (c : Conn) (dgram : ByteArray) : Bool :=
+  dgram.size ≥ 21 && c.peerCids.any fun (_, _, t) =>
+    t.size == 16 && t == dgram.extract (dgram.size - 16) dgram.size
+
+/-- The peer reset the connection statelessly: drain, sending nothing more (RFC 9000 §10.3.1). -/
+def reset (c : Conn) (now : Nat) : Conn :=
+  { c with phase := .draining (now + 3 * c.recovery.ptoDuration .application),
+           closeReason := c.closeReason <|> some (false, 0, "stateless reset") }
 
 /-- A 1-RTT packet failed authentication; past the integrity limit the connection closes. -/
 def authFailed (c : Conn) (now : Nat) : Conn :=
@@ -529,7 +622,9 @@ def recv (c : Conn) (now : Nat) (dgram : ByteArray) : Conn := Id.run do
         c := c.discardSpace .initial
       c := c.onPacket now sp o.pn o.payload
     | .short dcid pnOffset =>
-      if dcid != c.localCid then continue
+      if !c.isLocalCid dcid then
+        if c.isStatelessReset dgram then return c.reset now
+        continue
       -- A server processes no 1-RTT packet before its handshake completes (RFC 9001 §5.7).
       if !c.isClient && c.tls.established?.isNone then continue
       let some keys := c.app.readKeys | continue
@@ -545,7 +640,8 @@ def recv (c : Conn) (now : Nat) (dgram : ByteArray) : Conn := Id.run do
         (openPacket keys.next false pkt pnOffset c.app.largestRecv).filter
           fun o => o.phaseBit != c.keyPhase
       let some o := current <|> previous <|> updated
-        | c := c.authFailed now
+        | if c.isStatelessReset dgram then return c.reset now
+          c := c.authFailed now
           continue
       if o.firstByte &&& 0x18 != 0 then
         c := c.fail now .protocolViolation "reserved bits"
@@ -725,7 +821,7 @@ def headerOverhead (c : Conn) (sp : Space) : Nat :=
 
 /-- The next datagram to send, if any. -/
 def poll (c : Conn) (now : Nat) : Conn × Option ByteArray := Id.run do
-  let c := if c.isEstablished then c.checkKeyLimits now else c
+  let c := if c.isEstablished then (c.checkKeyLimits now).issueCids else c
   match c.phase with
   | .closed | .draining _ => return (c, none)
   | .closing d f sent =>
@@ -884,8 +980,18 @@ def takeIncoming (c : Conn) : Conn × Array Nat := ({ c with incoming := #[] }, 
 
 /-! ## Creating connections -/
 
+/-- A secret derived from the connection's entropy. -/
+def deriveSecret (seed : Vector UInt8 32) (label : String) : ByteArray :=
+  Cryptlib.Util.Bytes.ofVector
+    (Cryptlib.Primitives.MAC.HMAC.hmacSha256 (Cryptlib.Util.Bytes.ofVector seed) label.toUTF8)
+
+/-- The configuration with a reset key: the endpoint's, or else one of the connection's own. -/
+def withResetKey (cfg : Config) (seed : Vector UInt8 32) : Config :=
+  if cfg.resetKey.isEmpty then { cfg with resetKey := deriveSecret seed "quic reset" } else cfg
+
 def newClient (cfg : Config) (tlsCfg : LeanTLS.Handshake.Client.Config) (seed : Vector UInt8 32)
     (localCid dcid : ByteArray) (now : Nat) : Except LeanTLS.Alert Conn := do
+  let cfg := withResetKey cfg seed
   let params := localTransportParams cfg true localCid dcid none
   let tlsCfg := { tlsCfg with transportParams := params.encode }
   let (st, outs) ← LeanTLS.Handshake.Client.start tlsCfg seed
@@ -894,7 +1000,8 @@ def newClient (cfg : Config) (tlsCfg : LeanTLS.Handshake.Client.Config) (seed : 
     { isClient := true, config := cfg, tls := .client tlsCfg st, localCid, remoteCid := dcid,
       originalDcid := dcid, recovery := Recovery.init true maxDatagram, localParams := params,
       nextLocalStream := 0, localMaxStreams := cfg.maxStreamsBidi, localMaxData := cfg.maxData,
-      addressValidated := true, idleDeadline := some (now + cfg.idleTimeout * 1000) }
+      addressValidated := true, idleDeadline := some (now + cfg.idleTimeout * 1000),
+      localCids := [(0, localCid)], cidSecret := deriveSecret seed "quic cid" }
   c := c.setSpace .initial { c.initial with sealer := c.initial.sealer.rekey ck, readKeys := some sk }
   for o in outs do
     if let .send l d := o then
@@ -906,6 +1013,7 @@ client's Initial is addressed to `retrySource`, the connection ID the Retry gave
 client's address is already validated by the token. -/
 def newServer (cfg : Config) (tlsCfg : LeanTLS.Handshake.Server.Config) (seed : Vector UInt8 32)
     (localCid odcid peerCid : ByteArray) (now : Nat) (retrySource : Option ByteArray := none) : Conn :=
+  let cfg := withResetKey cfg seed
   let params := localTransportParams cfg false localCid odcid retrySource
   let tlsCfg := { tlsCfg with transportParams := params.encode }
   let (sk, ck) := initialKeys (retrySource.getD odcid)
@@ -915,7 +1023,8 @@ def newServer (cfg : Config) (tlsCfg : LeanTLS.Handshake.Server.Config) (seed : 
       retrySource, recovery := (Recovery.init false maxDatagram).setPeerCompletedAddressValidation,
       localParams := params, nextLocalStream := 1, localMaxStreams := cfg.maxStreamsBidi,
       localMaxData := cfg.maxData, addressValidated := retrySource.isSome,
-      idleDeadline := some (now + cfg.idleTimeout * 1000) }
+      idleDeadline := some (now + cfg.idleTimeout * 1000),
+      localCids := [(0, localCid)], cidSecret := deriveSecret seed "quic cid" }
   c.setSpace .initial { c.initial with sealer := c.initial.sealer.rekey ck, readKeys := some sk }
 
 end Conn

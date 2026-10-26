@@ -44,10 +44,18 @@ def checkToken (key addr rcid token : ByteArray) : Option ByteArray :=
     some odcid
   else none
 
+/-- A stateless reset for a packet of `size` bytes to `dcid` (RFC 9000 §10.3): shorter than what
+prompted it, at least 21 bytes, unpredictable bytes and then the reset token. -/
+def statelessReset (key dcid filler : ByteArray) (size : Nat) : ByteArray :=
+  let len := min (size - 1) 43
+  ⟨#[0x40 ||| (filler.get! 0 &&& 0x3f)]⟩ ++ filler.extract 1 (len - 16) ++ resetToken key dcid
+
 inductive Decision where
   | drop
   /-- Send this Retry packet back. -/
   | retry (packet : ByteArray)
+  /-- Send this stateless reset back. -/
+  | reset (packet : ByteArray)
   /-- A new connection, to be found by these connection IDs; it has not yet seen the datagram. -/
   | accept (conn : Conn) (cids : List ByteArray)
 
@@ -67,6 +75,11 @@ def onUnknown (cfg : Config) (addr dgram : ByteArray) (now : Nat) (fresh : ByteA
       | some odcid =>
         .accept (Conn.newServer cfg.quic cfg.tls seed dcid odcid scid now (some dcid)) [dcid]
       | none => .drop
+  | some (.short dcid _, _) =>
+    -- A packet for a connection we do not have: tell the peer, if it is long enough that the
+    -- reset can be shorter and still look like a packet.
+    if cfg.quic.resetKey.isEmpty || dgram.size ≤ 41 then .drop
+    else .reset (statelessReset cfg.quic.resetKey dcid (Conn.deriveSecret seed "reset filler") dgram.size)
   | _ => .drop
 
 end LeanQUIC.Endpoint
