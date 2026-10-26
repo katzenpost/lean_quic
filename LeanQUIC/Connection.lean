@@ -187,6 +187,16 @@ structure Conn where
   authFailures : Nat := 0
   /-- Key updates, ours and the peer's. -/
   keyUpdates : Nat := 0
+  /-- The peer's address as the driver names it, the one the last datagram came from, and the
+  last validated one while a new path is being validated. -/
+  peerAddr : ByteArray := ByteArray.empty
+  recvAddr : ByteArray := ByteArray.empty
+  prevPeerAddr : Option ByteArray := none
+  /-- The PATH_CHALLENGE data we await a response to, and when we give up on it. -/
+  pathChallenge : Option (ByteArray × Nat) := none
+  pathChallengesSent : Nat := 0
+  /-- Times the peer moved to a new address. -/
+  migrations : Nat := 0
   recovery : Recovery.State
   localParams : TransportParams
   peerParams : Option TransportParams := none
@@ -440,6 +450,13 @@ def onFrame (c : Conn) (now : Nat) (sp : Space) (f : Frame) : Except (TransportE
     | none => pure c
   | .maxStreams true m => pure { c with peerMaxStreams := max c.peerMaxStreams m }
   | .pathChallenge d => pure { c with pendingControl := c.pendingControl.push (.pathResponse d) }
+  | .pathResponse d =>
+    match c.pathChallenge with
+    | some (want, _) =>
+      if d == want then
+        pure { c with addressValidated := true, pathChallenge := none, prevPeerAddr := none }
+      else pure c
+    | none => pure c
   | .newConnectionId seq retirePriorTo cid token =>
     if cid.size == 0 || cid.size > 20 || retirePriorTo > seq then
       throw (.frameEncoding, "bad NEW_CONNECTION_ID")
@@ -561,6 +578,31 @@ def isStatelessReset (c : Conn) (dgram : ByteArray) : Bool :=
   dgram.size ≥ 21 && c.peerCids.any fun (_, _, t) =>
     t.size == 16 && t == dgram.extract (dgram.size - 16) dgram.size
 
+/-! ## Migration (RFC 9000 §9) -/
+
+/-- Challenge the peer's new address with unpredictable data. -/
+def challengePath (c : Conn) (now : Nat) : Conn :=
+  let n := c.pathChallengesSent
+  let data := (Cryptlib.Util.Bytes.ofVector (Cryptlib.Primitives.MAC.HMAC.hmacSha256 c.cidSecret
+    ("path".toUTF8 ++ ⟨(Array.range 8).map fun j => (n >>> (8 * j)).toUInt8⟩))).extract 0 8
+  { c with pathChallenge := some (data, now + 3 * c.recovery.ptoDuration .application),
+           pathChallengesSent := n + 1,
+           pendingControl := c.pendingControl.push (.pathChallenge data) }
+
+/-- The peer moved to `addr`: send there, on a fresh connection ID, with congestion control and RTT
+started over and the amplification limit in force until the new path is validated. -/
+def migrateTo (c : Conn) (now : Nat) (addr : ByteArray) (dgramSize : Nat) : Conn :=
+  let c := { c with prevPeerAddr := if c.addressValidated then some c.peerAddr else c.prevPeerAddr,
+                    peerAddr := addr, addressValidated := false, bytesRecv := dgramSize,
+                    bytesSent := 0, recovery := c.recovery.resetPath, migrations := c.migrations + 1 }
+  (c.rotateRemoteCid).challengePath now
+
+/-- A client moves to a new address: from now on it sends on a fresh connection ID of the server's,
+with congestion control started over, and a PING so the server sees a non-probing packet. -/
+def migrate (c : Conn) : Conn :=
+  let c := c.rotateRemoteCid
+  { c with recovery := c.recovery.resetPath, pendingControl := c.pendingControl.push Frame.ping }
+
 /-- The peer reset the connection statelessly: drain, sending nothing more (RFC 9000 §10.3.1). -/
 def reset (c : Conn) (now : Nat) : Conn :=
   { c with phase := .draining (now + 3 * c.recovery.ptoDuration .application),
@@ -652,8 +694,21 @@ def recv (c : Conn) (now : Nat) (dgram : ByteArray) : Conn := Id.run do
           continue
         c := (c.rotateKeys now).getD c
         c := { c with peerUpdateUnacked := true }
+      -- A non-probing packet with the highest packet number yet, from a new address, moves the
+      -- connection there (RFC 9000 §9.3).
+      let newest := c.app.largestRecv.all (o.pn > ·)
+      let nonProbing := (Frame.parseAll o.payload).any (·.any (!·.isProbing))
       c := c.onPacket now .application o.pn o.payload
+      if !c.isClient && !c.isClosed && newest && nonProbing && c.recvAddr != c.peerAddr then
+        c := c.migrateTo now c.recvAddr dgram.size
   pure c
+
+/-- A datagram from the peer at `addr`, the driver's name for its address. A connection follows the
+peer to a new address (RFC 9000 §9); `recv` alone never moves it. -/
+def recvFrom (c : Conn) (now : Nat) (addr dgram : ByteArray) : Conn :=
+  let c := if c.peerAddr.isEmpty then { c with peerAddr := addr } else c
+  let c := { c with recvAddr := addr }.recv now dgram
+  { c with recvAddr := c.peerAddr }
 
 /-! ## Sending -/
 
@@ -862,7 +917,9 @@ def poll (c : Conn) (now : Nat) : Conn × Option ByteArray := Id.run do
   if parts.isEmpty then return (c, none)
   -- A client pads every datagram with an Initial in it, a server those with an ack-eliciting
   -- Initial, to 1200 bytes (RFC 9000 §14.1).
-  let pad := parts.any fun (sp, b) => sp == .initial && (c.isClient || b.eliciting)
+  let pad := parts.any fun (sp, b) => sp == .initial && (c.isClient || b.eliciting) ||
+    -- Path validation datagrams too, as far as the amplification limit allows (RFC 9000 §8.2.1).
+    b.frames.any fun | .pathChallenge _ | .pathResponse _ => true | _ => false
   let mut dgram := ByteArray.empty
   for h : i in [0:parts.size] do
     let (sp, b) := parts[i]
@@ -885,7 +942,8 @@ def closeDeadline (c : Conn) : Option Nat :=
 
 def nextTimeout (c : Conn) : Option Nat :=
   if c.isClosed then none else
-  [c.recovery.lossDetectionDeadline, c.idleDeadline, c.closeDeadline, c.app.ackDeadline].filterMap id |>.foldl
+  [c.recovery.lossDetectionDeadline, c.idleDeadline, c.closeDeadline, c.app.ackDeadline,
+    c.pathChallenge.map (·.2)].filterMap id |>.foldl
     (fun acc d => some (match acc with | some a => min a d | none => d)) none
 
 def onTimeout (c : Conn) (now : Nat) : Conn := Id.run do
@@ -896,6 +954,12 @@ def onTimeout (c : Conn) (now : Nat) : Conn := Id.run do
   let c := match c.app.ackDeadline with
     | some d => if now ≥ d then c.modifySpace .application fun s =>
         { s with ackPending := true, ackDeadline := none } else c
+    | none => c
+  -- The new path did not validate in time: back to the last validated one (RFC 9000 §9.3.2).
+  let c := match c.pathChallenge with
+    | some (_, d) => if now ≥ d then
+        { c with peerAddr := c.prevPeerAddr.getD c.peerAddr, prevPeerAddr := none,
+                 pathChallenge := none, addressValidated := true } else c
     | none => c
   match c.recovery.lossDetectionDeadline with
   | some d =>

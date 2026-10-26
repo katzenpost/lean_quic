@@ -51,6 +51,8 @@ structure Sim where
   retries : Nat := 0
   /-- Both sides' connection configuration. -/
   cfg : LeanQUIC.Config := {}
+  /-- Where the server sees the client's datagrams come from. -/
+  clientAddr : ByteArray := "127.0.0.1:1".toUTF8
 
 def pattern (n : Nat) : ByteArray := ⟨Array.ofFn fun i : Fin n => UInt8.ofNat (i.val % 251)⟩
 
@@ -103,14 +105,14 @@ def endpoint (retry : Bool) (quic : LeanQUIC.Config := {}) : Endpoint.Config :=
 def deliver (retry : Bool) (sim : Sim) (toServer : Bool) (d : ByteArray) : Sim :=
   if toServer then
     match sim.server with
-    | some s => { sim with server := some (echo (s.recv sim.now d)) }
+    | some s => { sim with server := some (echo (s.recvFrom sim.now sim.clientAddr d)) }
     | none =>
       let seed : Vector UInt8 32 := Vector.ofFn fun i => UInt8.ofNat (200 + i.val)
-      match Endpoint.onUnknown (endpoint retry sim.cfg) "127.0.0.1:1".toUTF8 d sim.now ⟨#[7, 7, 7, 7, 7, 7, 7, 7]⟩ seed with
+      match Endpoint.onUnknown (endpoint retry sim.cfg) sim.clientAddr d sim.now ⟨#[7, 7, 7, 7, 7, 7, 7, 7]⟩ seed with
       | .drop => { sim with dropped := sim.dropped + 1 }
       | .retry pkt => { sim with wire := sim.wire.push (sim.now + 10000, false, pkt), retries := sim.retries + 1 }
       | .reset pkt => { sim with wire := sim.wire.push (sim.now + 10000, false, pkt) }
-      | .accept s _ => { sim with server := some (echo (s.recv sim.now d)) }
+      | .accept s _ => { sim with server := some (echo (s.recvFrom sim.now sim.clientAddr d)) }
   else { sim with client := sim.client.recv sim.now d }
 
 /-- Run a clean network until nothing is in flight and both sides are established. -/
@@ -245,6 +247,31 @@ def cidChecks : IO Nat := do
   if !ok then failed := failed + 1
   pure failed
 
+/-- Migration safety (RFC 9000 §9.3): a replayed packet from another address moves nothing, and a
+new path that never validates is given up for the old one. -/
+def pathChecks : IO Nat := do
+  let sim ← connected
+  let some srv := sim.server | throw (IO.userError "no server")
+  let now := sim.now + 100000
+  let mut failed := 0
+  let (c, id) := sim.client.openStream
+  let some id := id | throw (IO.userError "no stream")
+  let (_, ds) := drain ((c.write id (pattern 100)).finish id) now
+  let some d := ds[0]? | throw (IO.userError "no datagram")
+  let s1 := srv.recvFrom now sim.clientAddr d
+  let s2 := s1.recvFrom now "203.0.113.9:1".toUTF8 d
+  let replay := s2.migrations == srv.migrations && s2.peerAddr == sim.clientAddr
+  IO.println s!"  {if replay then "ok  " else "FAIL"}  a packet replayed from another address does not move the connection"
+  if !replay then failed := failed + 1
+  let s3 := s1.migrateTo now "203.0.113.9:1".toUTF8 1200
+  let some (_, deadline) := s3.pathChallenge | throw (IO.userError "no challenge")
+  let s4 := s3.onTimeout deadline
+  let back := s3.peerAddr == "203.0.113.9:1".toUTF8 && !s3.addressValidated &&
+    s4.peerAddr == sim.clientAddr && s4.addressValidated && s4.pathChallenge.isNone
+  IO.println s!"  {if back then "ok  " else "FAIL"}  a new path that does not validate is given up for the old one"
+  if !back then failed := failed + 1
+  pure failed
+
 def decision : Endpoint.Decision → String
   | .drop => "drop"
   | .retry _ => "retry"
@@ -295,7 +322,7 @@ structure Outcome where
 
 /-- Run the client application: payloads of `size` bytes on `streams` streams in turn. -/
 def runTransfer (net : Net) (size streams : Nat) (seed : Nat) (retry : Bool)
-    (cfg : LeanQUIC.Config := {}) : IO Outcome := do
+    (cfg : LeanQUIC.Config := {}) (migrateAt : Option (Nat × Bool) := none) : IO Outcome := do
   let t0 ← IO.monoMsNow
   let cseed : Vector UInt8 32 := Vector.ofFn fun i => UInt8.ofNat (i.val + seed)
   let start := 1000000
@@ -309,6 +336,7 @@ def runTransfer (net : Net) (size streams : Nat) (seed : Nat) (retry : Bool)
   let mut current : Option Nat := none
   let mut received := ByteArray.empty
   let mut failure : Option String := none
+  let mut migrated := false
   for _ in [0:200000] do
     -- Client application.
     if sim.client.isEstablished && done < streams then
@@ -332,6 +360,12 @@ def runTransfer (net : Net) (size streams : Nat) (seed : Nat) (retry : Bool)
           done := done + 1
           current := none
     if done == streams then break
+    -- The client's address changes at `t` ms: a NAT rebinding, or a migration of the client's own.
+    if let some (t, own) := migrateAt then
+      if !migrated && sim.now ≥ start + t * 1000 then
+        sim := { sim with clientAddr := "10.0.0.2:4433".toUTF8,
+                          client := if own then sim.client.migrate else sim.client }
+        migrated := true
     if sim.client.isClosed then
       let srvReason := sim.server.bind (·.closeReason)
       failure := some s!"client closed: {repr sim.client.closeReason}, server: {repr srvReason}"
@@ -361,7 +395,10 @@ def runTransfer (net : Net) (size streams : Nat) (seed : Nat) (retry : Bool)
       let srv := sim.server.map (fun s => (s.acksSent, s.elicitingRecv)) |>.getD (0, 0)
       let cli := (sim.client.acksSent, sim.client.elicitingRecv)
       let updates := (sim.client.keyUpdates, (sim.server.map (·.keyUpdates)).getD 0)
-      pure { ok := cfg.keyUpdateInterval == 0 || (updates.1 > 0 && updates.2 > 0),
+      let moved := sim.server.any fun s =>
+        s.migrations ≥ 1 && s.peerAddr == sim.clientAddr && s.addressValidated
+      pure { ok := (cfg.keyUpdateInterval == 0 || (updates.1 > 0 && updates.2 > 0)) &&
+               (migrateAt.isNone || moved),
              millis := t1 - t0, acks := (cli, srv),
              detail := s!"{size * streams} bytes, {sim.sentDatagrams} datagrams ({sim.dropped} dropped), {sim.retries} Retry, {simulated} ms simulated, ACKs {cli.1}/{cli.2} client, {srv.1}/{srv.2} server, key updates {updates.1} client, {updates.2} server" }
     else pure { ok := false, millis := t1 - t0,
@@ -372,6 +409,7 @@ def main : IO UInt32 := do
   failed := failed + (← ackChecks)
   failed := failed + (← keyChecks)
   failed := failed + (← cidChecks)
+  failed := failed + (← pathChecks)
   let cases : List (String × Net × Nat × Nat) := [
     ("clean, 1 byte", ⟨0, 0, 0⟩, 1, 1),
     ("clean, empty stream", ⟨0, 0, 0⟩, 0, 1),
@@ -393,6 +431,13 @@ def main : IO UInt32 := do
     for seed in [1, 2] do
       let o ← runTransfer net size 1 seed true { keyUpdateInterval := 50 }
       IO.println s!"  {if o.ok then "ok  " else "FAIL"}  {name}, key update every 50 packets (seed {seed}): {o.detail}, {o.millis} ms"
+      if !o.ok then failed := failed + 1
+  -- The client's address changes 100 ms in: the server follows once the new path validates.
+  for (name, net, own) in [("NAT rebinding", (⟨0, 0, 0⟩ : Net), false),
+      ("client migration", ⟨0, 0, 0⟩, true), ("client migration, 5% loss", ⟨5, 5, 1⟩, true)] do
+    for seed in [1, 2] do
+      let o ← runTransfer net 1000000 1 seed true {} (some (100, own))
+      IO.println s!"  {if o.ok then "ok  " else "FAIL"}  {name}, 1 MB (seed {seed}): {o.detail}, {o.millis} ms"
       if !o.ok then failed := failed + 1
   IO.println (if failed == 0 then "all loopback transfers passed" else s!"{failed} loopback transfers failed")
   pure (if failed == 0 then 0 else 1)

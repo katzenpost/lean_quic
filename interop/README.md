@@ -41,7 +41,9 @@ are set, lean-client to lean-server.
 Other variables: `SIZES`, `TIMEOUT` (seconds per client run, default 60),
 `LOSSY=0` to skip the proxy runs, `DROP` and `REORDER` (percent), `SEED`, and
 `KEY_UPDATE=N` to have the Lean endpoints update their keys every `N` packets
-(`--key-update N`).
+(`--key-update N`), and `REBIND=N` to have the proxy move to a new
+server-facing port after `N` client datagrams, closing the old one, as a NAT
+rebinding would (`--rebind-after N`).
 
 ## CLI contract
 
@@ -71,9 +73,10 @@ The Lean client appends ` keyupdates=<count>`, and both Lean endpoints take
 ## lossyproxy
 
     lossyproxy --listen ADDR --upstream ADDR --drop-percent P \
-        --reorder-percent R --seed S [--reorder-delay 10ms]
+        --reorder-percent R --seed S [--reorder-delay 10ms] [--rebind-after N]
 
 prints `READY`, relays datagrams, drops P% and delays R% behind later ones in
 both directions. On SIGTERM it prints
-`relayed=… dropped=… reordered=… retry=…` to stderr, where `retry` counts
-QUIC v1 Retry packets from the server.
+`relayed=… dropped=… reordered=… retry=… rebinds=…` to stderr, where `retry`
+counts QUIC v1 Retry packets from the server and `rebinds` the moves to a new
+port.

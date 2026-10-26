@@ -1,5 +1,6 @@
 // Command lossyproxy relays UDP datagrams between QUIC peers, dropping and
-// reordering a share of them.
+// reordering a share of them, and optionally moving its server-facing socket to
+// a new port partway through, as a NAT rebinding would.
 package main
 
 import (
@@ -25,6 +26,7 @@ type proxy struct {
 	held    atomic.Int64
 	relayed atomic.Int64
 	retries atomic.Int64
+	rebinds atomic.Int64
 }
 
 func (p *proxy) roll() (drop, hold bool) {
@@ -56,6 +58,7 @@ func main() {
 	reorderPct := flag.Float64("reorder-percent", 0, "percentage of datagrams delayed behind later ones")
 	delay := flag.Duration("reorder-delay", 10*time.Millisecond, "delay of a reordered datagram")
 	seed := flag.Uint64("seed", 1, "PRNG seed")
+	rebindAfter := flag.Int("rebind-after", 0, "move to a new server-facing port after this many client datagrams (0: never)")
 	flag.Parse()
 
 	p := &proxy{rng: rand.New(rand.NewPCG(*seed, *seed^0x9e3779b97f4a7c15)), drop: *dropPct, reorder: *reorderPct, delay: *delay}
@@ -76,34 +79,49 @@ func main() {
 
 	var mu sync.Mutex
 	backs := map[string]*net.UDPConn{}
+	counts := map[string]int{}
 	buf := make([]byte, 65535)
 	go report(p)
+	// dial opens a server-facing socket for client, relaying what comes back on it.
+	dial := func(client *net.UDPAddr) *net.UDPConn {
+		back, err := net.DialUDP("udp", nil, uaddr)
+		if err != nil {
+			fatal(err)
+		}
+		go func() {
+			b := make([]byte, 65535)
+			for {
+				n, err := back.Read(b)
+				if err != nil {
+					return
+				}
+				if isRetry(b[:n]) {
+					p.retries.Add(1)
+				}
+				p.forward(b[:n], func(d []byte) { front.WriteToUDP(d, client) })
+			}
+		}()
+		return back
+	}
 	for {
 		n, client, err := front.ReadFromUDP(buf)
 		if err != nil {
 			fatal(err)
 		}
 		mu.Lock()
-		back, ok := backs[client.String()]
+		key := client.String()
+		back, ok := backs[key]
 		if !ok {
-			if back, err = net.DialUDP("udp", nil, uaddr); err != nil {
-				mu.Unlock()
-				fatal(err)
-			}
-			backs[client.String()] = back
-			go func(back *net.UDPConn, client *net.UDPAddr) {
-				b := make([]byte, 65535)
-				for {
-					n, err := back.Read(b)
-					if err != nil {
-						return
-					}
-					if isRetry(b[:n]) {
-						p.retries.Add(1)
-					}
-					p.forward(b[:n], func(d []byte) { front.WriteToUDP(d, client) })
-				}
-			}(back, client)
+			back = dial(client)
+			backs[key] = back
+		}
+		counts[key]++
+		if *rebindAfter > 0 && counts[key] == *rebindAfter {
+			// As at a NAT, the old mapping goes: replies to it are lost.
+			back.Close()
+			back = dial(client)
+			backs[key] = back
+			p.rebinds.Add(1)
 		}
 		mu.Unlock()
 		p.forward(buf[:n], func(d []byte) { back.Write(d) })
@@ -119,7 +137,7 @@ func report(p *proxy) {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
 	<-sig
-	fmt.Fprintf(os.Stderr, "relayed=%d dropped=%d reordered=%d retry=%d\n", p.relayed.Load(), p.dropped.Load(), p.held.Load(), p.retries.Load())
+	fmt.Fprintf(os.Stderr, "relayed=%d dropped=%d reordered=%d retry=%d rebinds=%d\n", p.relayed.Load(), p.dropped.Load(), p.held.Load(), p.retries.Load(), p.rebinds.Load())
 	os.Exit(0)
 }
 
