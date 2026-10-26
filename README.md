@@ -5,7 +5,8 @@
 This library has not been audited by any third party.
 
 QUIC (RFC 9000, 9001, 9002) over [lean_tls](https://github.com/katzenpost/lean_tls)'s TLS 1.3
-handshake, negotiating the X25519MLKEM768 hybrid key exchange. The connection is a pure value:
+handshake, negotiating the X25519MLKEM768 hybrid key exchange, with the server authenticated by
+Ed25519 or, post-quantum too, ML-DSA-65. The connection is a pure value:
 `recv` gives it a datagram, `poll` asks for the next one to send, `onTimeout` reports a passed
 deadline, and the time is always an argument. The only IO is `LeanQUIC.UDP`, a driver over
 Lean's own `Std.Async.UDP`.
@@ -67,7 +68,10 @@ def main : IO Unit := do
 ```
 
 The server is authenticated by its key, not by a certificate authority: clients pin
-`SHA-256(SubjectPublicKeyInfo)`, which `spkiPin` computes.
+`SHA-256(SubjectPublicKeyInfo)`, which `spkiPin` computes. For post-quantum authentication, make
+the key ML-DSA-65's seed: `epochCertificate key .mldsa65` and `scheme := .mldsa65` in the TLS
+configuration. Its first flight is about 10 kB, which a server without a Retry sends within the
+3× amplification limit over a few round trips.
 
 ### A client
 

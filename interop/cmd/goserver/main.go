@@ -49,11 +49,16 @@ func main() {
 	listen := flag.String("listen", "127.0.0.1:4433", "UDP address to listen on")
 	seedHex := flag.String("seed", "", "32-byte hex seed of the Ed25519 TLS key")
 	certOut := flag.String("cert-out", "", "also write the leaf certificate DER to this file")
+	useMLDSA := flag.Bool("mldsa", false, "authenticate with ML-DSA-65 over plain quic-go and crypto/tls; the seed is its FIPS 204 seed")
 	flag.Parse()
 
 	seed, err := hex.DecodeString(*seedHex)
 	if err != nil || len(seed) != 32 {
 		fatal("--seed must be 64 hex characters")
+	}
+	if *useMLDSA {
+		serveMLDSA(*listen, seed)
+		return
 	}
 	key, err := loadKey(seed)
 	if err != nil {
@@ -88,8 +93,7 @@ func main() {
 	if w := l.UDPBuffers().Warning(); w != "" {
 		fmt.Fprintln(os.Stderr, "goserver:", w)
 	}
-	fmt.Printf("SPKI-SHA256 %x\nREADY\n", spki)
-	os.Stdout.Sync()
+	printReady(spki[:])
 
 	for {
 		c, err := l.Accept()
@@ -100,10 +104,18 @@ func main() {
 	}
 }
 
-func serve(qc *common.QuicConn) {
-	cs := qc.Conn.ConnectionState()
+func printReady(spki []byte) {
+	fmt.Printf("SPKI-SHA256 %x\nREADY\n", spki)
+	os.Stdout.Sync()
+}
+
+func logConn(cs tls.ConnectionState) {
 	fmt.Fprintf(os.Stderr, "conn group=%s alpn=%s suite=%s\n",
-		cs.TLS.CurveID, cs.TLS.NegotiatedProtocol, tls.CipherSuiteName(cs.TLS.CipherSuite))
+		cs.CurveID, cs.NegotiatedProtocol, tls.CipherSuiteName(cs.CipherSuite))
+}
+
+func serve(qc *common.QuicConn) {
+	logConn(qc.Conn.ConnectionState().TLS)
 	// The first stream goes through QuicConn exactly as katzenpost reads it.
 	if err := echoFirst(qc); err != nil {
 		logStreamErr(err)

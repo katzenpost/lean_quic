@@ -13,7 +13,7 @@ interop harness does over UDP. -/
 def identity : Vector UInt8 32 := Vector.ofFn fun i => UInt8.ofNat (50 + i.val)
 def serverKey : ByteArray := ofVector (LeanTLS.Handshake.ed25519.pub identity)
 def serverCert : ByteArray :=
-  X509.selfSigned (fun m => ofVector (LeanTLS.Handshake.ed25519.sign identity m ()).1) serverKey
+  X509.selfSigned (fun m => ofVector (Cryptlib.Primitives.Sign.Ed25519Math.signNative identity m)) serverKey
     ⟨Array.replicate 16 9⟩ 1761433200 1761436800
 def serverPin : ByteArray :=
   match X509.parseLeaf serverCert with
@@ -25,6 +25,19 @@ def serverTls : LeanTLS.Handshake.Server.Config :=
   { alpn := h3, transportParams := ByteArray.empty, signingKey := identity, certificate := serverCert }
 def clientTls : LeanTLS.Handshake.Client.Config :=
   { alpn := h3, transportParams := ByteArray.empty, pins := [serverPin] }
+
+/-- The same server authenticating with ML-DSA-65, and a client that accepts nothing else. -/
+def pqCert : ByteArray :=
+  match X509.certificateFor .mldsa65 (ofVector identity) ⟨Array.replicate 32 4⟩ ⟨Array.replicate 16 9⟩
+      1761433200 1761436800 with
+  | .ok c => c
+  | .error _ => ByteArray.empty
+def pqServerTls : LeanTLS.Handshake.Server.Config :=
+  { serverTls with scheme := .mldsa65, certificate := pqCert }
+def pqClientTls : LeanTLS.Handshake.Client.Config :=
+  { clientTls with schemes := [.mldsa65], pins := match X509.parseLeaf pqCert with
+      | .ok leaf => [KeySchedule.hash leaf.spki]
+      | .error _ => [] }
 
 /-- A deterministic generator for the network's choices. -/
 structure Lcg where
@@ -53,6 +66,8 @@ structure Sim where
   cfg : LeanQUIC.Config := {}
   /-- Where the server sees the client's datagrams come from. -/
   clientAddr : ByteArray := "127.0.0.1:1".toUTF8
+  /-- The server's TLS configuration. -/
+  tls : LeanTLS.Handshake.Server.Config := serverTls
 
 def pattern (n : Nat) : ByteArray := ⟨Array.ofFn fun i : Fin n => UInt8.ofNat (i.val % 251)⟩
 
@@ -100,8 +115,8 @@ def echo (c : Conn) : Conn := Id.run do
     c := c.retire id
   pure c
 
-def endpoint (retry : Bool) (quic : LeanQUIC.Config := {}) : Endpoint.Config :=
-  { quic, tls := serverTls, retry, tokenKey := ⟨Array.replicate 32 3⟩ }
+def endpoint (retry : Bool) (quic : LeanQUIC.Config := {}) (tls := serverTls) : Endpoint.Config :=
+  { quic, tls, retry, tokenKey := ⟨Array.replicate 32 3⟩ }
 
 def deliver (retry : Bool) (sim : Sim) (toServer : Bool) (d : ByteArray) : Sim :=
   if toServer then
@@ -109,7 +124,7 @@ def deliver (retry : Bool) (sim : Sim) (toServer : Bool) (d : ByteArray) : Sim :
     | some s => { sim with server := some (echo (s.recvFrom sim.now sim.clientAddr d)) }
     | none =>
       let seed : Vector UInt8 32 := Vector.ofFn fun i => UInt8.ofNat (200 + i.val)
-      match Endpoint.onUnknown (endpoint retry sim.cfg) sim.clientAddr d sim.now ⟨#[7, 7, 7, 7, 7, 7, 7, 7]⟩ seed with
+      match Endpoint.onUnknown (endpoint retry sim.cfg sim.tls) sim.clientAddr d sim.now ⟨#[7, 7, 7, 7, 7, 7, 7, 7]⟩ seed with
       | .drop => { sim with dropped := sim.dropped + 1 }
       | .retry pkt => { sim with wire := sim.wire.push (sim.now + 10000, false, pkt), retries := sim.retries + 1 }
       | .reset pkt => { sim with wire := sim.wire.push (sim.now + 10000, false, pkt) }
@@ -341,6 +356,28 @@ def tokenChecks : IO Nat := do
     if !ok then failed := failed + 1
   pure failed
 
+/-- Anti-amplification (RFC 9000 §8.1): before the client's address is validated, an ML-DSA-65
+server sends at most three times what it received, less than its 10 kB first flight, and the rest
+as more of the client's datagrams arrive. -/
+def amplificationChecks : IO Nat := do
+  let now := 1000000
+  let client ← match Conn.newClient {} pqClientTls (Vector.replicate 32 6) ⟨#[1, 2, 3, 4, 5, 6, 7, 8]⟩
+      ⟨#[9, 8, 7, 6, 5, 4, 3, 2]⟩ now with
+    | .ok c => pure c
+    | .error a => throw (IO.userError s!"client: {repr a}")
+  let (_, first) := drain client now
+  let some d := first[0]? | throw (IO.userError "no Initial")
+  let .accept srv _ := Endpoint.onUnknown (endpoint false {} pqServerTls) "127.0.0.1:1".toUTF8 d now
+      ⟨#[7, 7, 7, 7, 7, 7, 7, 7]⟩ (Vector.replicate 32 3)
+    | throw (IO.userError "not accepted")
+  let srv := first.foldl (fun s d => s.recv now d) srv
+  let received := first.foldl (· + ·.size) 0
+  let (_, out) := drain srv now
+  let sent := out.foldl (· + ·.size) 0
+  let ok := sent ≤ 3 * received && sent > 2 * received && sent < 9000
+  IO.println s!"  {if ok then "ok  " else "FAIL"}  an unvalidated ML-DSA-65 server answers {received} bytes with {sent}"
+  pure (if ok then 0 else 1)
+
 structure Outcome where
   ok : Bool
   detail : String
@@ -350,15 +387,17 @@ structure Outcome where
 
 /-- Run the client application: payloads of `size` bytes on `streams` streams in turn. -/
 def runTransfer (net : Net) (size streams : Nat) (seed : Nat) (retry : Bool)
-    (cfg : LeanQUIC.Config := {}) (migrateAt : Option (Nat × Bool) := none) : IO Outcome := do
+    (cfg : LeanQUIC.Config := {}) (migrateAt : Option (Nat × Bool) := none) (pq : Bool := false) :
+    IO Outcome := do
   let t0 ← IO.monoMsNow
   let cseed : Vector UInt8 32 := Vector.ofFn fun i => UInt8.ofNat (i.val + seed)
   let start := 1000000
-  let client ← match Conn.newClient cfg clientTls cseed ⟨#[1, 2, 3, 4, 5, 6, 7, 8]⟩
-      ⟨#[9, 8, 7, 6, 5, 4, 3, 2]⟩ start with
+  let client ← match Conn.newClient cfg (if pq then pqClientTls else clientTls) cseed
+      ⟨#[1, 2, 3, 4, 5, 6, 7, 8]⟩ ⟨#[9, 8, 7, 6, 5, 4, 3, 2]⟩ start with
     | .ok c => pure c
     | .error a => throw (IO.userError s!"client: {repr a}")
-  let mut sim : Sim := { now := start, rng := { s := seed }, client, cfg }
+  let mut sim : Sim := { now := start, rng := { s := seed }, client, cfg,
+                         tls := if pq then pqServerTls else serverTls }
   let payload := pattern size
   let mut done := 0
   let mut current : Option Nat := none
@@ -425,8 +464,9 @@ def runTransfer (net : Net) (size streams : Nat) (seed : Nat) (retry : Bool)
       let updates := (sim.client.keyUpdates, (sim.server.map (·.keyUpdates)).getD 0)
       let moved := sim.server.any fun s =>
         s.migrations ≥ 1 && s.peerAddr == sim.clientAddr && s.addressValidated
+      let auth := sim.client.tls.authScheme?
       pure { ok := (cfg.keyUpdateInterval == 0 || (updates.1 > 0 && updates.2 > 0)) &&
-               (migrateAt.isNone || moved),
+               (migrateAt.isNone || moved) && (!pq || auth == some .mldsa65),
              millis := t1 - t0, acks := (cli, srv),
              detail := s!"{size * streams} bytes, {sim.sentDatagrams} datagrams ({sim.dropped} dropped), {sim.retries} Retry, {simulated} ms simulated, ACKs {cli.1}/{cli.2} client, {srv.1}/{srv.2} server, key updates {updates.1} client, {updates.2} server" }
     else pure { ok := false, millis := t1 - t0,
@@ -439,6 +479,7 @@ def main : IO UInt32 := do
   failed := failed + (← cidChecks)
   failed := failed + (← pathChecks)
   failed := failed + (← uniChecks)
+  failed := failed + (← amplificationChecks)
   let cases : List (String × Net × Nat × Nat) := [
     ("clean, 1 byte", ⟨0, 0, 0⟩, 1, 1),
     ("clean, empty stream", ⟨0, 0, 0⟩, 0, 1),
@@ -460,6 +501,14 @@ def main : IO UInt32 := do
     for seed in [1, 2] do
       let o ← runTransfer net size 1 seed true { keyUpdateInterval := 50 }
       IO.println s!"  {if o.ok then "ok  " else "FAIL"}  {name}, key update every 50 packets (seed {seed}): {o.detail}, {o.millis} ms"
+      if !o.ok then failed := failed + 1
+  -- ML-DSA-65 authentication: a first flight of about 10 kB, through the amplification limit
+  -- without a Retry.
+  for (name, net, retry) in [("ML-DSA-65, Retry", (⟨0, 0, 0⟩ : Net), true),
+      ("ML-DSA-65, no Retry", ⟨0, 0, 0⟩, false), ("ML-DSA-65, no Retry, 5% loss", ⟨5, 5, 1⟩, false)] do
+    for seed in [1, 2] do
+      let o ← runTransfer net 100000 1 seed retry {} none true
+      IO.println s!"  {if o.ok then "ok  " else "FAIL"}  {name}, 100 kB (seed {seed}): {o.detail}, {o.millis} ms"
       if !o.ok then failed := failed + 1
   -- The client's address changes 100 ms in: the server follows once the new path validates.
   for (name, net, own) in [("NAT rebinding", (⟨0, 0, 0⟩ : Net), false),

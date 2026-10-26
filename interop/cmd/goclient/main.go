@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"os"
 	"time"
@@ -63,6 +64,7 @@ func main() {
 	size := flag.Int("payload-size", 100000, "bytes sent on each stream")
 	streams := flag.Int("streams", 1, "number of sequential bidirectional streams")
 	timeout := flag.Duration("timeout", 60*time.Second, "overall deadline")
+	useMLDSA := flag.Bool("mldsa", false, "accept only an ML-DSA-65 certificate, over plain quic-go and crypto/tls")
 	flag.Parse()
 
 	pin, err := hex.DecodeString(*pinHex)
@@ -75,9 +77,22 @@ func main() {
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
-	u := &url.URL{Scheme: "quic", Host: *connect}
 	dialCtx, dialCancel := context.WithTimeout(ctx, 10*time.Second)
-	conn, err := common.DialURL(u, dialCtx, nil, pin, (*common.Options)(nil).ForClient())
+	var qconn *quic.Conn
+	var first *quic.Stream
+	auth := "Ed25519"
+	if *useMLDSA {
+		qconn, err = dialMLDSA(dialCtx, *connect, pin)
+		auth = "ML-DSA-65"
+	} else {
+		u := &url.URL{Scheme: "quic", Host: *connect}
+		var conn net.Conn
+		conn, err = common.DialURL(u, dialCtx, nil, pin, (*common.Options)(nil).ForClient())
+		if err == nil {
+			qc := conn.(*common.QuicConn)
+			qconn, first = qc.Conn, qc.Stream
+		}
+	}
 	dialCancel()
 	if errors.Is(err, common.ErrQUICKeyMismatch) {
 		fatal("pin mismatch: %v", err)
@@ -85,10 +100,9 @@ func main() {
 	if err != nil {
 		fatal("dial: %v", err)
 	}
-	qc := conn.(*common.QuicConn)
-	defer qc.Conn.CloseWithError(0, "")
+	defer qconn.CloseWithError(0, "")
 
-	cs := qc.Conn.ConnectionState().TLS
+	cs := qconn.ConnectionState().TLS
 	suite := tls.CipherSuiteName(cs.CipherSuite)
 	if cs.CurveID != tls.X25519MLKEM768 {
 		fatal("negotiated group %s, want %s", cs.CurveID, tls.X25519MLKEM768)
@@ -96,9 +110,9 @@ func main() {
 
 	want := payload(*size)
 	for i := 0; i < *streams; i++ {
-		s := qc.Stream
-		if i > 0 {
-			if s, err = qc.Conn.OpenStreamSync(ctx); err != nil {
+		s := first
+		if i > 0 || s == nil {
+			if s, err = qconn.OpenStreamSync(ctx); err != nil {
 				fatal("stream %d: open: %v", i, err)
 			}
 		}
@@ -109,5 +123,5 @@ func main() {
 			fatal("stream %d: %v", i, err)
 		}
 	}
-	fmt.Printf("OK bytes=%d group=%s suite=%s\n", *size**streams, cs.CurveID, suite)
+	fmt.Printf("OK bytes=%d group=%s suite=%s auth=%s\n", *size**streams, cs.CurveID, suite, auth)
 }

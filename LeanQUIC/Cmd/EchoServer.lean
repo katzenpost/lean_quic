@@ -23,10 +23,12 @@ def main (args : List String) : IO UInt32 := do
     | IO.eprintln "--seed must be 64 hex digits"; return 2
   if seed.size != 32 then IO.eprintln "--seed must be 64 hex digits"; return 2
   let key := toVecN 32 seed
-  let cert ← epochCertificate key
+  let scheme : LeanTLS.Handshake.Scheme := if args.contains "--mldsa" then .mldsa65 else .ed25519
+  let cert ← epochCertificate key scheme
   let some pin := spkiPin cert | IO.eprintln "certificate does not parse"; return 1
   let tls : LeanTLS.Handshake.Server.Config :=
-    { alpn := "h3".toUTF8, transportParams := ByteArray.empty, signingKey := key, certificate := cert }
+    { alpn := "h3".toUTF8, transportParams := ByteArray.empty, scheme, signingKey := key,
+      certificate := cert }
   let keyUpdate := ((argOf args "--key-update").bind String.toNat?).getD 0
   let tokenKey ← randomBytes 32
   let cfg : Endpoint.Config :=
