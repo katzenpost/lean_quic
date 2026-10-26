@@ -50,3 +50,15 @@ jobs:
           KEY_UPDATE: "50"
           SIZES: "3000000"
         run: ./run.sh
+      - name: Interoperate through a NAT rebinding
+        working-directory: interop
+        env:
+          LEAN_ABORT_ON_PANIC: "1"
+          LEAN_SERVER: ${{ github.workspace }}/.lake/build/bin/quic_echo_server
+          LEAN_CLIENT: ${{ github.workspace }}/.lake/build/bin/quic_echo_client
+          TIMEOUT: "180"
+          REBIND: "100"
+          DROP: "0"
+          REORDER: "0"
+          SIZES: "1"
+        run: ./run.sh

@@ -107,6 +107,15 @@ def init (isClient : Bool) (maxDatagramSize : Nat := 1200) : State :=
     cwnd := kInitialWindow maxDatagramSize,
     cwnd_ge := kMinimumWindow_le_kInitialWindow maxDatagramSize }
 
+/-- A new network path: congestion control and the RTT estimate start over, the packets in flight
+stay (RFC 9000 §9.4). -/
+def resetPath (s : State) : State :=
+  { s with cwnd := kInitialWindow s.maxDatagramSize,
+           cwnd_ge := kMinimumWindow_le_kInitialWindow s.maxDatagramSize,
+           ssthresh := none, recoveryStart := none, caAcked := 0, latestRtt := 0,
+           smoothed := kInitialRtt, rttvar := kInitialRtt / 2, rttMin := none,
+           firstRttSampleTime := none }
+
 /-- Peer's max_ack_delay transport parameter, in µs (default 25 ms). -/
 def setMaxAckDelay (s : State) (us : Nat) : State := { s with maxAckDelay := us }
 def setHandshakeConfirmed (s : State) : State :=
@@ -443,6 +452,7 @@ theorem ptoTimeAndSpace_app_unconfirmed (s : State) (now : Nat)
 /-! Dot-notation names for the operations on `State`. -/
 
 @[inline] abbrev State.setMaxAckDelay := @LeanQUIC.Recovery.setMaxAckDelay
+@[inline] abbrev State.resetPath := @LeanQUIC.Recovery.resetPath
 @[inline] abbrev State.setHandshakeConfirmed := @LeanQUIC.Recovery.setHandshakeConfirmed
 @[inline] abbrev State.setPeerCompletedAddressValidation := @LeanQUIC.Recovery.setPeerCompletedAddressValidation
 @[inline] abbrev State.setAmplificationLimited := @LeanQUIC.Recovery.setAmplificationLimited

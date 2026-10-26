@@ -14,6 +14,8 @@ LEAN_SERVER=${LEAN_SERVER:-}
 LEAN_CLIENT=${LEAN_CLIENT:-}
 # Packets between key updates the Lean endpoints start themselves; empty for none.
 KEY_UPDATE=${KEY_UPDATE:-}
+# Client datagrams after which the proxy moves to a new server-facing port; empty for never.
+REBIND=${REBIND:-}
 
 export QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING=true
 
@@ -99,7 +101,7 @@ run() {
 		if [ "$lossy" = yes ]; then
 			port=$(free_port)
 			spawn "$log.proxy" "$here/bin/lossyproxy" --listen "127.0.0.1:$port" --upstream "127.0.0.1:$sport" \
-				--drop-percent "$DROP" --reorder-percent "$REORDER" --seed "$n"
+				--drop-percent "$DROP" --reorder-percent "$REORDER" --seed "$n" ${REBIND:+--rebind-after "$REBIND"}
 			ppid=$spawned
 			await_ready "$log.proxy" "$ppid" || detail="proxy not ready"
 		fi

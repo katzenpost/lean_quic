@@ -130,6 +130,8 @@ partial def runClient {α : Type} (cfg : Config) (tls : LeanTLS.Handshake.Client
 structure Peer where
   addr : SocketAddress
   conn : Conn
+  /-- The addresses the peer was last seen at, by the name the connection knows them by. -/
+  addrs : List (ByteArray × SocketAddress) := []
   /-- The connection IDs the endpoint gave the connection at first. -/
   initial : List ByteArray
   /-- The connection IDs that lead to it now. -/
@@ -166,7 +168,9 @@ partial def runServer (cfg : Endpoint.Config) (listen : SocketAddress)
       if p.conn.isClosed then
         ps := { ps with conns := ps.conns.erase i, byCid := p.cids.foldl (·.erase ·) ps.byCid }
       else
-        let c ← sendAll sock p.conn (some p.addr)
+        -- Send where the connection says the peer is; it moves only to a validated new path.
+        let addr := (p.addrs.find? (·.1 == p.conn.peerAddr)).map (·.2) |>.getD p.addr
+        let c ← sendAll sock p.conn (some addr)
         ps := ps.put i { p with conn := c }
     let deadline := ps.conns.fold (fun acc _ p => match acc, p.conn.nextTimeout with
       | some a, some b => some (min a b) | none, b => b | a, none => a) none
@@ -184,7 +188,9 @@ partial def runServer (cfg : Endpoint.Config) (listen : SocketAddress)
         match ps.byCid[dcid]?.bind (ps.conns[·]?) with
         | some p =>
           let i := ps.byCid[dcid]!
-          ps := ps.put i { p with addr, conn := app (p.conn.recv now d) }
+          let name := (toString addr).toUTF8
+          let addrs := ((name, addr) :: p.addrs.filter (·.1 != name)).take 4
+          ps := ps.put i { p with addrs, conn := app (p.conn.recvFrom now name d) }
         | none =>
           let fresh ← (randomBytes cidLength : IO _)
           let seed ← (randomSeed : IO _)
@@ -193,9 +199,11 @@ partial def runServer (cfg : Endpoint.Config) (listen : SocketAddress)
           | .retry pkt => sock.send pkt (some addr)
           | .reset pkt => sock.send pkt (some addr)
           | .accept c cids =>
-            let c := app (c.recv now d)
+            let name := (toString addr).toUTF8
+            let c := app (c.recvFrom now name d)
             let i := ps.next
-            ps := { ps with next := i + 1 }.put i { addr, conn := c, initial := cids, cids := [] }
+            ps := { ps with next := i + 1 }.put i
+              { addr, addrs := [(name, addr)], conn := c, initial := cids, cids := [] }
       | none => pure ()
     | .datagram _ none => pure ()
     loop ps

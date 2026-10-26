@@ -39,6 +39,11 @@ deriving Inhabited
 
 namespace Frame
 
+/-- Frames that may go on a path being probed without moving to it (RFC 9000 §9.1). -/
+def isProbing : Frame → Bool
+  | padding _ | pathChallenge _ | pathResponse _ | newConnectionId .. => true
+  | _ => false
+
 /-- Whether receiving the frame calls for an acknowledgment (RFC 9000 §13.2). -/
 def ackEliciting : Frame → Bool
   | padding _ | ack _ _ | connectionClose _ _ _ _ => false
