@@ -1,0 +1,39 @@
+name: Lean Action CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: leanprover/lean-action@v1
+        with:
+          build-args: "LeanQUIC LeanQUIC.Tests.Vectors LeanQUIC.Tests.Recovery LeanQUIC.Tests.Buffers LeanQUIC.Tests.Loopback quic_echo_server quic_echo_client"
+      - name: Run tests
+        env:
+          # panics in compiled Lean print a message but exit 0 unless this is set
+          LEAN_ABORT_ON_PANIC: "1"
+        run: |
+          ./.lake/build/bin/LeanQUIC-Tests-Vectors
+          ./.lake/build/bin/LeanQUIC-Tests-Recovery
+          ./.lake/build/bin/LeanQUIC-Tests-Buffers
+          ./.lake/build/bin/LeanQUIC-Tests-Loopback
+      - name: Check the test vectors match their recorded hashes
+        run: sha256sum -c testdata/rfc9001_appendix_a.json.sha256
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: interop/go.mod
+          cache-dependency-path: interop/go.sum
+      - name: Interoperate with katzenpost's quic-go transport
+        working-directory: interop
+        env:
+          LEAN_ABORT_ON_PANIC: "1"
+          LEAN_SERVER: ${{ github.workspace }}/.lake/build/bin/quic_echo_server
+          LEAN_CLIENT: ${{ github.workspace }}/.lake/build/bin/quic_echo_client
+          TIMEOUT: "180"
+        run: ./run.sh

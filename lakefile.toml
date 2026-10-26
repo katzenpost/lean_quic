@@ -1,0 +1,39 @@
+name = "lean_quic"
+version = "0.1.0"
+description = "QUIC written in Lean"
+keywords = ["quic", "tls", "post-quantum", "networking", "protocol"]
+license = "AGPL-3.0-only"
+defaultTargets = ["LeanQUIC"]
+
+[leanOptions]
+pp.unicode.fun = true
+autoImplicit = false
+relaxedAutoImplicit = false
+
+[[require]]
+name = "lean_tls"
+git = "https://github.com/katzenpost/lean_tls.git"
+rev = "375b3870ef0caffc7462481f057c2d47e3696791"
+
+[[lean_lib]]
+name = "LeanQUIC"
+
+[[lean_exe]]
+name = "LeanQUIC.Tests.Vectors"
+
+[[lean_exe]]
+name = "LeanQUIC.Tests.Loopback"
+
+[[lean_exe]]
+name = "LeanQUIC.Tests.Recovery"
+
+[[lean_exe]]
+name = "LeanQUIC.Tests.Buffers"
+
+[[lean_exe]]
+name = "quic_echo_server"
+root = "LeanQUIC.Cmd.EchoServer"
+
+[[lean_exe]]
+name = "quic_echo_client"
+root = "LeanQUIC.Cmd.EchoClient"
