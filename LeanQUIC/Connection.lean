@@ -68,6 +68,11 @@ def recv (t : Tls) (level : Level) (data : ByteArray) : Except LeanTLS.Alert (Tl
     let (st', out) ← LeanTLS.Handshake.Server.recv cfg seed st level data
     pure (.server cfg seed st', out)
 
+/-- How the server authenticated: on a client, once TLS has verified it; on a server, its own. -/
+def authScheme? : Tls → Option LeanTLS.Handshake.Scheme
+  | .client _ st => st.established?.map (·.serverKey.scheme)
+  | .server cfg _ _ => some cfg.scheme
+
 /-- The peer's transport parameters, once TLS has authenticated the handshake. -/
 def established? : Tls → Option ByteArray
   | .client _ st => st.established?.map (·.peerTransportParams)

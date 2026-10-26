@@ -43,7 +43,10 @@ Other variables: `SIZES`, `TIMEOUT` (seconds per client run, default 60),
 `KEY_UPDATE=N` to have the Lean endpoints update their keys every `N` packets
 (`--key-update N`), and `REBIND=N` to have the proxy move to a new
 server-facing port after `N` client datagrams, closing the old one, as a NAT
-rebinding would (`--rebind-after N`).
+rebinding would (`--rebind-after N`), and `MLDSA=1` to authenticate the server
+with ML-DSA-65 instead of Ed25519 (`--mldsa` on every program; the Go programs
+then use plain quic-go and `crypto/tls`, since katzenpost's `quic/common`
+carries Ed25519 epoch certificates only).
 
 ## CLI contract
 
@@ -67,8 +70,10 @@ the group is not X25519MLKEM768 or the echo differs, and otherwise prints
 
     OK bytes=<N*K> group=X25519MLKEM768 suite=<cipher suite>
 
-The Lean client appends ` keyupdates=<count>`, and both Lean endpoints take
-`--key-update N` to start a key update every N packets.
+Both clients append ` auth=<Ed25519|ML-DSA-65>`, the Lean client also
+` keyupdates=<count>`; both Lean endpoints take `--key-update N` to start a key
+update every N packets, and every program takes `--mldsa`: the server signs with
+ML-DSA-65 (the seed is its FIPS 204 seed), the client accepts only that.
 
 ## lossyproxy
 

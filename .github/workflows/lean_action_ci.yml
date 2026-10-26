@@ -62,3 +62,12 @@ jobs:
           REORDER: "0"
           SIZES: "1"
         run: ./run.sh
+      - name: Interoperate with ML-DSA-65 server authentication
+        working-directory: interop
+        env:
+          LEAN_ABORT_ON_PANIC: "1"
+          LEAN_SERVER: ${{ github.workspace }}/.lake/build/bin/quic_echo_server
+          LEAN_CLIENT: ${{ github.workspace }}/.lake/build/bin/quic_echo_client
+          TIMEOUT: "180"
+          MLDSA: "1"
+        run: ./run.sh

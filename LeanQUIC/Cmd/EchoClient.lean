@@ -29,7 +29,8 @@ def main (args : List String) : IO UInt32 := do
   let streams := ((argOf args "--streams").bind String.toNat?).getD 1
   let payload : ByteArray := ⟨Array.ofFn fun i : Fin size => UInt8.ofNat (i.val % 251)⟩
   let tls : LeanTLS.Handshake.Client.Config :=
-    { alpn := "h3".toUTF8, transportParams := ByteArray.empty, pins := [pin] }
+    { alpn := "h3".toUTF8, transportParams := ByteArray.empty, pins := [pin],
+      schemes := if args.contains "--mldsa" then [.mldsa65] else [.ed25519, .mldsa65] }
   let st ← IO.mkRef ({} : Progress)
   let app (c : Conn) : IO (Conn × Option String) := do
     let mut c := c
@@ -38,7 +39,9 @@ def main (args : List String) : IO UInt32 := do
     for _ in [0:2] do
       if p.done == streams then
         let suite := (c.app.writeKeys.map (·.suite.cipherSuite.name)).getD "?"
-        return (c, some s!"OK bytes={size * streams} group=X25519MLKEM768 suite={suite} keyupdates={c.keyUpdates}")
+        let auth := match c.tls.authScheme? with
+          | some .mldsa65 => "ML-DSA-65" | some .ed25519 => "Ed25519" | none => "?"
+        return (c, some s!"OK bytes={size * streams} group=X25519MLKEM768 suite={suite} auth={auth} keyupdates={c.keyUpdates}")
       match p.current with
       | none =>
         let (c', id) := c.openStream

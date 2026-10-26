@@ -9,7 +9,7 @@ transport. Run: `lake exe example_sansio`. -/
 
 def key : Vector UInt8 32 := Vector.replicate 32 1
 def cert : ByteArray :=
-  LeanTLS.X509.selfSigned (fun m => ofVector (LeanTLS.Handshake.ed25519.sign key m ()).1)
+  LeanTLS.X509.selfSigned (fun m => ofVector (Cryptlib.Primitives.Sign.Ed25519Math.signNative key m))
     (ofVector (LeanTLS.Handshake.ed25519.pub key)) (ByteArray.mk (Array.replicate 16 1)) 0 86400
 def pin : ByteArray := match LeanTLS.X509.parseLeaf cert with
   | .ok leaf => LeanTLS.KeySchedule.hash leaf.spki

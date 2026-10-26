@@ -16,6 +16,8 @@ LEAN_CLIENT=${LEAN_CLIENT:-}
 KEY_UPDATE=${KEY_UPDATE:-}
 # Client datagrams after which the proxy moves to a new server-facing port; empty for never.
 REBIND=${REBIND:-}
+# MLDSA=1: every endpoint authenticates the server with ML-DSA-65 instead of Ed25519.
+MLDSA=${MLDSA:-}
 
 export QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING=true
 
@@ -40,6 +42,7 @@ free_port() {
 
 # Extra arguments for an endpoint.
 args_for() {
+	[ -n "$MLDSA" ] && echo "--mldsa"
 	case $1 in
 	lean-*) [ -n "$KEY_UPDATE" ] && echo "--key-update $KEY_UPDATE" ;;
 	esac

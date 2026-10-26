@@ -82,15 +82,17 @@ def waitEvent (sock : Socket) (deadline : Option Nat) : Async Event := do
 def epochGenesis : Nat := 1496275200
 def epochPeriod : Nat := 1200
 
-/-- A self-signed Ed25519 certificate valid from the start of the previous epoch to the start of
-the epoch after next, as katzenpost's `epochCertificate`. -/
-def epochCertificate (signingKey : Vector UInt8 32) : IO ByteArray := do
+/-- A self-signed certificate, Ed25519 or ML-DSA-65, valid from the start of the previous epoch to
+the start of the epoch after next, as katzenpost's `epochCertificate`. -/
+def epochCertificate (signingKey : Vector UInt8 32)
+    (scheme : LeanTLS.Handshake.Scheme := .ed25519) : IO ByteArray := do
   let unix := (← Std.Time.Timestamp.now).toSecondsSinceUnixEpoch.val.toNat
   let epoch := (unix - epochGenesis) / epochPeriod
   let serial ← randomBytes 16
-  let key := ofVector (LeanTLS.Handshake.ed25519.pub signingKey)
-  pure (LeanTLS.X509.selfSigned (fun m => ofVector (LeanTLS.Handshake.ed25519.sign signingKey m ()).1)
-    key serial (epochGenesis + (epoch - 1) * epochPeriod) (epochGenesis + (epoch + 2) * epochPeriod))
+  match LeanTLS.X509.certificateFor scheme (ofVector signingKey) (← randomBytes 32) serial
+      (epochGenesis + (epoch - 1) * epochPeriod) (epochGenesis + (epoch + 2) * epochPeriod) with
+  | .ok cert => pure cert
+  | .error a => throw (IO.userError s!"signing the certificate: {repr a}")
 
 def spkiPin (cert : ByteArray) : Option ByteArray :=
   match LeanTLS.X509.parseLeaf cert with
