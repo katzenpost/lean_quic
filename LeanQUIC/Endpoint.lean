@@ -15,9 +15,14 @@ open Cryptlib.Util.Bytes (ofVector)
 
 What to do with an Initial whose Destination Connection ID belongs to no connection: as
 katzenpost's QUIC servers do, first answer with a Retry (RFC 9000 §8.1.2), whose token binds the
-client's address and its original Destination Connection ID under the endpoint's key, and accept
-the connection only when the client comes back with that token. The token is the address proof:
-a server holds no state for a client until it has one. -/
+client's address, its original Destination Connection ID and the time it was issued under the
+endpoint's key, and accept the connection only when the client comes back with that token before
+it expires. The token is the address proof: a server holds no state for a client until it has
+one.
+
+Times are the endpoint's own clock in microseconds (`UDP.nowUs` is monotonic and starts afresh
+with each process), so a token can only be checked by the process that issued it; a `tokenKey`
+drawn per process, as the examples do, makes sure of that. -/
 
 structure Config where
   quic : LeanQUIC.Config := {}
@@ -25,22 +30,37 @@ structure Config where
   retry : Bool := true
   /-- The key retry tokens are authenticated under. -/
   tokenKey : ByteArray
+  /-- How long a retry token stays valid, in microseconds. -/
+  tokenLifetime : Nat := 10_000_000
 
-/-- `HMAC(key, address ‖ odcid ‖ the Retry's connection ID)`, truncated to 16 bytes. -/
-def tokenTag (key addr odcid rcid : ByteArray) : ByteArray :=
-  (ofVector (hmacSha256 key (addr ++ ⟨#[UInt8.ofNat odcid.size]⟩ ++ odcid ++ rcid))).extract 0 16
+/-- `n` as 8 big-endian bytes. -/
+def be64 (n : Nat) : ByteArray :=
+  ⟨(Array.range 8).map fun i => UInt8.ofNat (n >>> (8 * (7 - i)))⟩
 
-def makeToken (key addr odcid rcid : ByteArray) : ByteArray :=
-  ⟨#[UInt8.ofNat odcid.size]⟩ ++ odcid ++ tokenTag key addr odcid rcid
+def readBe64 (b : ByteArray) : Nat :=
+  b.foldl (fun acc x => acc * 256 + x.toNat) 0
+
+/-- `HMAC(key, address ‖ odcid ‖ issued ‖ the Retry's connection ID)`, truncated to 16 bytes. -/
+def tokenTag (key addr odcid issued rcid : ByteArray) : ByteArray :=
+  (ofVector (hmacSha256 key
+    (addr ++ ⟨#[UInt8.ofNat odcid.size]⟩ ++ odcid ++ issued ++ rcid))).extract 0 16
+
+/-- `len ‖ odcid ‖ issued (8 bytes) ‖ tag (16 bytes)`. -/
+def makeToken (key addr odcid rcid : ByteArray) (now : Nat) : ByteArray :=
+  let issued := be64 now
+  ⟨#[UInt8.ofNat odcid.size]⟩ ++ odcid ++ issued ++ tokenTag key addr odcid issued rcid
 
 /-- The original Destination Connection ID in a token, if the token is ours for this address and
-this Retry connection ID. -/
-def checkToken (key addr rcid token : ByteArray) : Option ByteArray :=
+this Retry connection ID, and was issued no more than `lifetime` before `now`. -/
+def checkToken (key addr rcid token : ByteArray) (now lifetime : Nat) : Option ByteArray :=
   if token.size < 1 then none else
   let n := (token.get! 0).toNat
-  if n < 8 || n > 20 || token.size != 1 + n + 16 then none else
+  if n < 8 || n > 20 || token.size != 1 + n + 8 + 16 then none else
   let odcid := token.extract 1 (1 + n)
-  if LeanTLS.Handshake.ctEq (token.extract (1 + n) token.size) (tokenTag key addr odcid rcid) then
+  let issued := token.extract (1 + n) (1 + n + 8)
+  let t := readBe64 issued
+  if LeanTLS.Handshake.ctEq (token.extract (1 + n + 8) token.size)
+      (tokenTag key addr odcid issued rcid) && t ≤ now && now - t ≤ lifetime then
     some odcid
   else none
 
@@ -62,8 +82,8 @@ def onUnknown (cfg : Config) (addr dgram : ByteArray) (now : Nat) (fresh : ByteA
     else if !cfg.retry then
       .accept (Conn.newServer cfg.quic cfg.tls seed fresh dcid scid now) [dcid, fresh]
     else if token.size == 0 then
-      .retry (retryPacket dcid scid fresh (makeToken cfg.tokenKey addr dcid fresh))
-    else match checkToken cfg.tokenKey addr dcid token with
+      .retry (retryPacket dcid scid fresh (makeToken cfg.tokenKey addr dcid fresh now))
+    else match checkToken cfg.tokenKey addr dcid token now cfg.tokenLifetime with
       | some odcid =>
         .accept (Conn.newServer cfg.quic cfg.tls seed dcid odcid scid now (some dcid)) [dcid]
       | none => .drop
