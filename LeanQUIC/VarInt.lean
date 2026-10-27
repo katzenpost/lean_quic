@@ -35,6 +35,7 @@ def varint : Parser Nat := do
   pure (rest.foldl (fun acc x => acc * 256 + x.toNat) (b0 &&& 0x3f).toNat)
 
 def writeVarInt (v : Nat) : Writer Unit := do
-  if v ≤ VarInt.max then Writer.bytes (encodeVarInt v) else throw .internalError
+  -- `v ≤ VarInt.max`, without building the 62-bit bound from its decimal digits on every call
+  if v >>> 62 = 0 then Writer.bytes (encodeVarInt v) else throw .internalError
 
 end LeanQUIC
