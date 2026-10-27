@@ -402,6 +402,20 @@ def quiet (sim : Sim) (stopAt : Nat) : Sim := Id.run do
       sim := deliver false sim toServer d
   pure { sim with now := stopAt }
 
+/-- Closing an established connection (RFC 9000 §10.2): the CONNECTION_CLOSE goes out under the
+1-RTT keys, and the peer drains at once instead of waiting out its idle timeout. -/
+def closeChecks : IO Nat := do
+  let mut failed := 0
+  for (name, byServer) in [("server", true), ("client", false)] do
+    let sim ← connected
+    let sim := if byServer then { sim with server := sim.server.map (·.close sim.now) }
+      else { sim with client := sim.client.close sim.now }
+    let sim := quiet sim (sim.now + 2000000)
+    let peerGone := if byServer then sim.client.isClosed else sim.server.any (·.isClosed)
+    IO.println s!"  {if peerGone then "ok  " else "FAIL"}  the {name} closes: its peer is closed 2 s later"
+    if !peerGone then failed := failed + 1
+  pure failed
+
 /-- Keep-alive (RFC 9000 §10.1.2): with a 1 s idle timeout, a connection quiet for 10 s closes
 unless the sides send a PING after 300 ms of quiet, and then both stay open. -/
 def keepAliveChecks : IO Nat := do
@@ -512,6 +526,7 @@ def main : IO UInt32 := do
   failed := failed + (← uniChecks)
   failed := failed + (← amplificationChecks)
   failed := failed + (← keepAliveChecks)
+  failed := failed + (← closeChecks)
   let cases : List (String × Net × Nat × Nat) := [
     ("clean, 1 byte", ⟨0, 0, 0⟩, 1, 1),
     ("clean, empty stream", ⟨0, 0, 0⟩, 0, 1),

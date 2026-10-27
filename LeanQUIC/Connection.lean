@@ -918,7 +918,8 @@ def poll (c : Conn) (now : Nat) : Conn × Option ByteArray := Id.run do
   | .closed | .draining _ => return (c, none)
   | .closing d f sent =>
     if sent then return (c, none)
-    let sp : Space := if c.app.writeKeys.isSome && c.isEstablished then .application
+    -- Once the handshake is confirmed the peer reads only 1-RTT packets (RFC 9000 §10.2.3).
+    let sp : Space := if c.app.writeKeys.isSome && c.handshakeConfirmed then .application
       else if c.handshake.writeKeys.isSome then .handshake else .initial
     if (c.space sp).writeKeys.isNone then return ({ c with phase := .closing d f true }, none)
     let f := match f, sp with
