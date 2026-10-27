@@ -158,6 +158,9 @@ structure Config where
   resetKey : ByteArray := ByteArray.empty
   /-- Connection IDs we accept from the peer, and offer it at most (`active_connection_id_limit`). -/
   activeCidLimit : Nat := 4
+  /-- Send a PING after this many milliseconds without sending an ack-eliciting packet, so a quiet
+  connection outlives the idle timeout (RFC 9000 §10.1.2); 0 never. -/
+  keepAlive : Nat := 0
 
 structure Conn where
   isClient : Bool
@@ -235,6 +238,8 @@ structure Conn where
   elicitingRecv : Nat := 0
   acksSent : Nat := 0
   idleDeadline : Option Nat := none
+  /-- When a quiet established connection sends a PING, under `Config.keepAlive`. -/
+  keepAliveDeadline : Option Nat := none
   probe : Option (Space × Nat) := none
   phase : Phase := .handshaking
   /-- Why the connection closed: our error, or the peer's close code. -/
@@ -893,6 +898,8 @@ def sealPacket (c : Conn) (now : Nat) (sp : Space) (b : Built) (target : Nat) :
     let inFlight := b.eliciting || target > 0
     let sent := if b.sent.isEmpty && !b.eliciting then s.sent else s.sent.insert pn b.sent
     let c := c.setSpace sp { s with sealer, sent }
+    let c := if b.eliciting && c.config.keepAlive > 0 then
+      { c with keepAliveDeadline := some (now + c.config.keepAlive * 1000) } else c
     let record : Recovery.SentPacket :=
       { pn, timeSent := now, ackEliciting := b.eliciting, inFlight, size := pkt.size }
     ({ c with recovery := c.recovery.onPacketSent sp record }, pkt)
@@ -973,7 +980,7 @@ def closeDeadline (c : Conn) : Option Nat :=
 def nextTimeout (c : Conn) : Option Nat :=
   if c.isClosed then none else
   [c.recovery.lossDetectionDeadline, c.idleDeadline, c.closeDeadline, c.app.ackDeadline,
-    c.pathChallenge.map (·.2)].filterMap id |>.foldl
+    c.pathChallenge.map (·.2), if c.isEstablished then c.keepAliveDeadline else none].filterMap id |>.foldl
     (fun acc d => some (match acc with | some a => min a d | none => d)) none
 
 def onTimeout (c : Conn) (now : Nat) : Conn := Id.run do
@@ -984,6 +991,10 @@ def onTimeout (c : Conn) (now : Nat) : Conn := Id.run do
   let c := match c.app.ackDeadline with
     | some d => if now ≥ d then c.modifySpace .application fun s =>
         { s with ackPending := true, ackDeadline := none } else c
+    | none => c
+  let c := match c.keepAliveDeadline with
+    | some d => if c.isEstablished && now ≥ d then
+        { c with keepAliveDeadline := none, pendingControl := c.pendingControl.push .ping } else c
     | none => c
   -- The new path did not validate in time: back to the last validated one (RFC 9000 §9.3.2).
   let c := match c.pathChallenge with

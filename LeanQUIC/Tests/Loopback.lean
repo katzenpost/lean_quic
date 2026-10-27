@@ -385,6 +385,37 @@ structure Outcome where
   /-- ACK frames sent and ack-eliciting packets received, by the client and by the server. -/
   acks : (Nat × Nat) × (Nat × Nat) := ((0, 0), (0, 0))
 
+/-- Run both sides with no application data until `stopAt`, firing every timer when it is due. -/
+def quiet (sim : Sim) (stopAt : Nat) : Sim := Id.run do
+  let mut sim := sim
+  for _ in [0:100000] do
+    sim := flush ⟨0, 0, 0⟩ sim
+    let timers := [sim.client.nextTimeout, sim.server.bind (·.nextTimeout)].filterMap id
+    let next := (sim.wire.map (·.1) ++ timers.toArray).foldl min stopAt
+    if next ≥ stopAt then break
+    sim := { sim with now := next,
+                      client := if sim.client.nextTimeout.any (· ≤ next) then sim.client.onTimeout next else sim.client,
+                      server := sim.server.map fun s => if s.nextTimeout.any (· ≤ next) then s.onTimeout next else s }
+    let (due, later) := sim.wire.partition (·.1 ≤ sim.now)
+    sim := { sim with wire := later }
+    for (_, toServer, d) in due do
+      sim := deliver false sim toServer d
+  pure { sim with now := stopAt }
+
+/-- Keep-alive (RFC 9000 §10.1.2): with a 1 s idle timeout, a connection quiet for 10 s closes
+unless the sides send a PING after 300 ms of quiet, and then both stay open. -/
+def keepAliveChecks : IO Nat := do
+  let mut failed := 0
+  for (ka, expectOpen) in [(0, false), (300, true)] do
+    let sim ← connected { idleTimeout := 1000, keepAlive := ka }
+    let sim := quiet sim (sim.now + 10000000)
+    let open_ := !sim.client.isClosed && sim.server.any (!·.isClosed)
+    let closed := sim.client.isClosed && sim.server.any (·.isClosed)
+    let ok := if expectOpen then open_ else closed
+    IO.println s!"  {if ok then "ok  " else "FAIL"}  keep-alive {ka} ms, 10 s quiet: {if open_ then "open" else if closed then "closed" else "half closed"}"
+    if !ok then failed := failed + 1
+  pure failed
+
 /-- Run the client application: payloads of `size` bytes on `streams` streams in turn. -/
 def runTransfer (net : Net) (size streams : Nat) (seed : Nat) (retry : Bool)
     (cfg : LeanQUIC.Config := {}) (migrateAt : Option (Nat × Bool) := none) (pq : Bool := false) :
@@ -480,6 +511,7 @@ def main : IO UInt32 := do
   failed := failed + (← pathChecks)
   failed := failed + (← uniChecks)
   failed := failed + (← amplificationChecks)
+  failed := failed + (← keepAliveChecks)
   let cases : List (String × Net × Nat × Nat) := [
     ("clean, 1 byte", ⟨0, 0, 0⟩, 1, 1),
     ("clean, empty stream", ⟨0, 0, 0⟩, 0, 1),
