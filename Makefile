@@ -1,4 +1,4 @@
-.PHONY: build test axioms interop
+.PHONY: build test axioms interop bench
 
 build:
 	lake build LeanQUIC LeanQUIC.Tests.Vectors LeanQUIC.Tests.Recovery LeanQUIC.Tests.Buffers \
@@ -17,3 +17,10 @@ axioms: build
 interop: build
 	cd interop && LEAN_SERVER=$(CURDIR)/.lake/build/bin/quic_echo_server \
 	  LEAN_CLIENT=$(CURDIR)/.lake/build/bin/quic_echo_client ./run.sh
+
+# Extra LeanBench flags, e.g. `make bench BENCH_ARGS='--match "poll" --samples 5'`.
+BENCH_ARGS ?=
+
+# The benchmarks are their own Lake project in bench/, so the library does not depend on LeanBench.
+bench:
+	cd bench && lake -q --log-level=error exe lean_quic-bench $(BENCH_ARGS)
