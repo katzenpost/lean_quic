@@ -14,6 +14,9 @@ jobs:
       - uses: leanprover/lean-action@v1
         with:
           build-args: "LeanQUIC LeanQUIC.Tests.Vectors LeanQUIC.Tests.Recovery LeanQUIC.Tests.Buffers LeanQUIC.Tests.Loopback quic_echo_server quic_echo_client example_server example_client example_sansio"
+      - name: Build the benchmarks (their own Lake project)
+        working-directory: bench
+        run: lake build
       - name: Run tests
         env:
           # panics in compiled Lean print a message but exit 0 unless this is set
