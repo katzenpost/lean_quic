@@ -106,8 +106,8 @@ def mask (k : Keys) (sample : Vector UInt8 16) : Vector UInt8 5 :=
   k.suite.cipherSuite.hpMask k.hp sample
 
 /-- XOR the mask into the first byte (its low 4 bits for a long header, 5 for a short one) and the
-`pnLen` packet number bytes at `pnOffset`. -/
-def applyMask (long : Bool) (pkt : ByteArray) (pnOffset pnLen : Nat) (m : Vector UInt8 5) :
+`pnLen` packet number bytes at `pnOffset`, byte by byte over the whole packet. -/
+def applyMaskSpec (long : Bool) (pkt : ByteArray) (pnOffset pnLen : Nat) (m : Vector UInt8 5) :
     ByteArray :=
   let bits : UInt8 := if long then 0x0f else 0x1f
   ⟨pkt.data.mapIdx fun i b =>
@@ -116,14 +116,63 @@ def applyMask (long : Bool) (pkt : ByteArray) (pnOffset pnLen : Nat) (m : Vector
       b ^^^ m.toArray.getD (i - pnOffset + 1) 0
     else b⟩
 
+/-- XOR `v` into byte `i` of `pkt`, if it has one. -/
+private def xorAt (pkt : ByteArray) (i : Nat) (v : UInt8) : ByteArray :=
+  if i < pkt.size then pkt.set! i (pkt[i]! ^^^ v) else pkt
+
+/-- `applyMaskSpec`, changing only the masked bytes in place (`applyMask_eq_spec`). -/
+def applyMask (long : Bool) (pkt : ByteArray) (pnOffset pnLen : Nat) (m : Vector UInt8 5) :
+    ByteArray :=
+  let bits : UInt8 := if long then 0x0f else 0x1f
+  let pn (p : ByteArray) (k : Nat) : ByteArray :=
+    xorAt p (pnOffset + k) (if k < pnLen ∧ pnOffset + k ≠ 0 then m.toArray.getD (k + 1) 0 else 0)
+  pn (pn (pn (pn (xorAt pkt 0 (m[0] &&& bits)) 0) 1) 2) 3
+
+@[simp] private theorem size_xorAt (pkt : ByteArray) (i : Nat) (v : UInt8) :
+    (xorAt pkt i v).size = pkt.size := by
+  unfold xorAt; split <;> simp
+
+private theorem getElem!_xorAt (pkt : ByteArray) (i j : Nat) (v : UInt8) (hj : j < pkt.size) :
+    (xorAt pkt i v)[j]! = if i = j then pkt[j]! ^^^ v else pkt[j]! := by
+  unfold xorAt
+  split
+  · rw [ByteArray.getElem!_set! _ _ _ _ ‹_›]
+    split <;> simp_all
+  · split <;> simp_all
+
+private theorem getElem_eq_getElem! (a : ByteArray) (j : Nat) (h : j < a.size) : a[j] = a[j]! :=
+  (getElem!_pos a j h).symm
+
+theorem applyMask_eq_spec (long : Bool) (pkt : ByteArray) (pnOffset pnLen : Nat) (m : Vector UInt8 5) :
+    applyMask long pkt pnOffset pnLen m = applyMaskSpec long pkt pnOffset pnLen m := by
+  have hs : (applyMask long pkt pnOffset pnLen m).size = pkt.size := by simp [applyMask]
+  have hs' : (applyMaskSpec long pkt pnOffset pnLen m).size = pkt.size := by
+    show (Array.mapIdx _ pkt.data).size = pkt.data.size
+    simp
+  apply ByteArray.ext_getElem (by rw [hs, hs'])
+  intro j h1 h2
+  have hj : j < pkt.size := hs ▸ h1
+  have hdata (a : ByteArray) (h : j < a.size) : a[j] = a.data[j]'h := rfl
+  rw [getElem_eq_getElem! _ _ h1, hdata _ h2]
+  simp only [applyMask, applyMaskSpec, Array.getElem_mapIdx, getElem!_xorAt, size_xorAt, hj]
+  rw [← getElem_eq_getElem! pkt j hj, hdata _ hj]
+  generalize pkt.data[j] = b
+  clear hdata h1 h2 hs hs' hj
+  by_cases e0 : 0 = j <;> by_cases e1 : pnOffset + 0 = j <;> by_cases e2 : pnOffset + 1 = j <;>
+    by_cases e3 : pnOffset + 2 = j <;> by_cases e4 : pnOffset + 3 = j <;>
+    simp only [e0, e1, e2, e3, e4, ite_true, ite_false] <;> (try omega)
+  all_goals split_ifs <;> simp_all <;> (try omega)
+  all_goals subst_vars; simp
+
 theorem applyMask_applyMask (long : Bool) (pkt : ByteArray) (pnOffset pnLen : Nat)
     (m : Vector UInt8 5) :
     applyMask long (applyMask long pkt pnOffset pnLen m) pnOffset pnLen m = pkt := by
+  simp only [applyMask_eq_spec]
   apply ByteArray.ext
   apply Array.ext
-  · simp [applyMask]
+  · simp [applyMaskSpec]
   · intro i h1 h2
-    simp only [applyMask, Array.getElem_mapIdx]
+    simp only [applyMaskSpec, Array.getElem_mapIdx]
     split
     · rw [UInt8.xor_assoc, UInt8.xor_self, UInt8.xor_zero]
     · rename_i hc0
