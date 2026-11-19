@@ -13,7 +13,7 @@ relaxedAutoImplicit = false
 [[require]]
 name = "lean_tls"
 git = "https://github.com/katzenpost/lean_tls.git"
-rev = "2965a2b7227c55eb55d7d9ce03d4c73e01a42e08"
+rev = "e8f5fe34be3e6a07a02a19c2d71cec0b5f012ddb"
 
 [[lean_lib]]
 name = "LeanQUIC"
